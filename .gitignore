@@ -1,5 +1,6 @@
 # Rust / Tauri build output
 src-tauri/target/
+src-tauri/windivert-prebuilt/
 
 # Node.js
 node_modules/
@@ -26,3 +27,6 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Generated release verification output
+docs/security-check.generated.md

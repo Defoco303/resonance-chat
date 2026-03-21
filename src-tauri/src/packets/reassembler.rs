@@ -64,6 +64,18 @@ impl Reassembler {
     }
 
     pub fn feed_owned(&mut self, bytes: Vec<u8>) {
+        if self.cursor > 0 {
+            self.compact();
+        }
+
+        if bytes.len() > self.max_buffer_size
+            || self.buffer.len().saturating_add(bytes.len()) > self.max_buffer_size
+        {
+            self.buffer.clear();
+            self.cursor = 0;
+            return;
+        }
+
         if self.cursor == 0 && self.buffer.is_empty() {
             self.buffer = bytes;
             return;
@@ -71,13 +83,4 @@ impl Reassembler {
         self.buffer.extend_from_slice(&bytes);
     }
 
-    pub fn take_remaining(&mut self) -> Vec<u8> {
-        if self.cursor == 0 {
-            return std::mem::take(&mut self.buffer);
-        }
-        let rem = self.buffer.split_off(self.cursor);
-        self.buffer = Vec::new();
-        self.cursor = 0;
-        rem
-    }
 }

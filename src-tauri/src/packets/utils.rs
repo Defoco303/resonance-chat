@@ -80,10 +80,18 @@ impl TCPReassembler {
             }
         }
 
-        if self.buffered_bytes > MAX_TCP_CACHE_SIZE {
-            if let Some((&first_cached_seq, _)) = self.cache.iter().next() {
-                self.next_seq = Some(first_cached_seq);
-            }
+        while self.buffered_bytes > MAX_TCP_CACHE_SIZE {
+            let Some(first_cached_seq) = self.cache.keys().next().copied() else {
+                break;
+            };
+            let Some(removed) = self.cache.remove(&first_cached_seq) else {
+                break;
+            };
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(removed.len());
+        }
+
+        if let Some(first_cached_seq) = self.cache.keys().next().copied() {
+            self.next_seq = Some(first_cached_seq);
         }
 
         let mut cursor = self.next_seq.unwrap();
