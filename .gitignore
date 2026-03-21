@@ -1,0 +1,28 @@
+# Rust / Tauri build output
+src-tauri/target/
+
+# Node.js
+node_modules/
+
+# SvelteKit build output
+build/
+.svelte-kit/
+
+# Environment files (security)
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Logs
+*.log
+npm-debug.log*

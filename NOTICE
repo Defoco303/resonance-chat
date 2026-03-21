@@ -1,0 +1,48 @@
+Resonance Chat - Third-party Notices
+=====================================
+
+This software includes the following third-party components:
+
+---------------------------------------------------------------------------
+WinDivert
+---------------------------------------------------------------------------
+Copyright (C) 2018, basil
+
+This software includes WinDivert (https://github.com/basil00/WinDivert),
+which is licensed under the GNU Lesser General Public License v3 (LGPL-3.0).
+
+The WinDivert binaries (WinDivert.dll, WinDivert64.sys) are distributed
+with this software under the terms of the LGPL-3.0.
+
+The full text of the LGPL-3.0 license is available at:
+https://www.gnu.org/licenses/lgpl-3.0.html
+
+Source code for WinDivert is available at:
+https://github.com/basil00/WinDivert
+
+---------------------------------------------------------------------------
+Tauri
+---------------------------------------------------------------------------
+Copyright (c) 2019-present Tauri Programme within The Commons Conservancy
+
+Licensed under the MIT License and the Apache License, Version 2.0.
+https://github.com/tauri-apps/tauri
+
+---------------------------------------------------------------------------
+Svelte / SvelteKit
+---------------------------------------------------------------------------
+Copyright (c) 2016-present, Rich Harris and contributors
+
+Licensed under the MIT License.
+https://github.com/sveltejs/svelte
+
+---------------------------------------------------------------------------
+Other Rust dependencies
+---------------------------------------------------------------------------
+etherparse   - MIT / Apache-2.0
+zstd         - MIT
+byteorder    - MIT / Unlicense
+serde        - MIT / Apache-2.0
+
+Other npm dependencies are listed in package.json and are licensed under
+their respective open-source licenses (MIT or Apache-2.0).

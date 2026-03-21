@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tauri:*)",
+      "Bash(npm run:*)",
+      "Bash(where cargo:*)",
+      "Bash(where rustc:*)",
+      "Bash(cmd.exe /c \"where cargo\" 2>&1)",
+      "Bash(cmd.exe /c \"cargo --version\" 2>&1)",
+      "Bash(cmd.exe /c \"echo %PATH%\" 2>&1)",
+      "Bash(powershell.exe -Command \"Get-Command cargo -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source\")",
+      "Bash(export PATH=\"$PATH:/c/Users/copen/.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin:/c/Users/copen/.cargo/bin\")",
+      "Bash(cargo --version)",
+      "Bash(cargo build:*)"
+    ]
+  }
+}
