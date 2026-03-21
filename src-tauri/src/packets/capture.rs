@@ -11,6 +11,13 @@ use tauri::{AppHandle, Emitter};
 use windivert::WinDivert;
 use windivert::prelude::WinDivertFlags;
 
+#[derive(Clone, serde::Serialize)]
+struct CaptureStatusPayload {
+    code: &'static str,
+    level: &'static str,
+    message: String,
+}
+
 const CHAT_SERVICE_UUID: u64 = 0x0000000009d4a768;
 const CHAT_METHOD_ID: u32 = 1;
 const FRAG_NOTIFY: u16 = 2;
@@ -32,6 +39,7 @@ pub fn start_capture(handle: AppHandle) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Failed to open WinDivert: {e}");
+            emit_capture_status(&handle, &e.to_string());
             return;
         }
     };
@@ -48,6 +56,7 @@ pub fn start_capture(handle: AppHandle) {
                 eprintln!("WinDivert recv error: {e}");
                 if e.to_string().contains("invalid handle") || e.to_string().contains("access denied")
                 {
+                    emit_capture_status(&handle, &e.to_string());
                     break;
                 }
                 continue;
@@ -124,6 +133,37 @@ pub fn start_capture(handle: AppHandle) {
             }
         }
     }
+}
+
+fn emit_capture_status(handle: &AppHandle, error_text: &str) {
+    let lower = error_text.to_ascii_lowercase();
+    let (code, message) = if lower.contains("access denied") {
+        (
+            "admin_required",
+            "管理者権限がないため、チャットの取得を開始できませんでした。インストーラー完了画面から起動した場合は一度アプリを閉じて、スタートメニューまたは EXE から起動し直してください。".to_string(),
+        )
+    } else if lower.contains("invalid handle") {
+        (
+            "capture_stopped",
+            "チャット取得が停止しました。アプリを再起動しても改善しない場合は、Windows を再起動してから再度お試しください。".to_string(),
+        )
+    } else {
+        (
+            "capture_error",
+            format!(
+                "チャット取得の初期化に失敗しました。詳細: {error_text}"
+            ),
+        )
+    };
+
+    let _ = handle.emit(
+        "capture-status",
+        CaptureStatusPayload {
+            code,
+            level: "error",
+            message,
+        },
+    );
 }
 
 fn detect_game_server_ip(src_ip: [u8; 4], payload: &[u8]) -> Option<[u8; 4]> {

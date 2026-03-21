@@ -35,7 +35,10 @@
             "./WinDivert64.sys"
         ],
         "windows": {
-            "webviewInstallMode": { "type": "downloadBootstrapper" }
+            "webviewInstallMode": { "type": "downloadBootstrapper" },
+            "nsis": {
+                "installerHooks": "./installer-hooks.nsh"
+            }
         }
     }
 }

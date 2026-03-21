@@ -8,6 +8,12 @@
     sender_name: string; text: string; timestamp: number;
   }
 
+  interface CaptureStatus {
+    code: string;
+    level: string;
+    message: string;
+  }
+
   const TABS = [
     { id: 0, name: 'すべて' }, { id: 1, name: 'ワールド' },
     { id: 2, name: 'チャンネル' }, { id: 3, name: 'パーティ' }, { id: 4, name: 'ギルド' },
@@ -75,6 +81,7 @@
 
   let notifyAudio: HTMLAudioElement | null = null;
   let audioCtx: AudioContext | null = null;
+  let captureStatus = $state<CaptureStatus | null>(null);
 
   const filtered = $derived(
     (activeTab === 0 ? messages : messages.filter(m => m.channel === activeTab))
@@ -285,12 +292,18 @@
       };
       load(); window.speechSynthesis.onvoiceschanged = load;
     }
-    const unlisten = await listen<ChatMessage>('chat-message', ({ payload: msg }) => {
+    const unlistenChat = await listen<ChatMessage>('chat-message', ({ payload: msg }) => {
       messages = [...messages.slice(-999), msg];
       if (autoScroll && listEl) setTimeout(() => { listEl!.scrollTop = listEl!.scrollHeight; }, 0);
       speak(msg); checkKeywords(msg);
     });
-    return unlisten;
+    const unlistenStatus = await listen<CaptureStatus>('capture-status', ({ payload }) => {
+      captureStatus = payload;
+    });
+    return () => {
+      unlistenChat();
+      unlistenStatus();
+    };
   });
 </script>
 
@@ -313,6 +326,21 @@
       </svg>
     </button>
   </header>
+
+  {#if captureStatus}
+    <div class="status-banner" class:error={captureStatus.level === 'error'}>
+      <div class="status-copy">
+        <strong>チャット取得を開始できませんでした</strong>
+        <div>{captureStatus.message}</div>
+      </div>
+      <button
+        class="status-close"
+        type="button"
+        aria-label="警告を閉じる"
+        onclick={() => { captureStatus = null; }}
+      >閉じる</button>
+    </div>
+  {/if}
 
   <div class="messages" bind:this={listEl} onscroll={onScroll}>
     {#each filtered as msg (`${msg.timestamp}-${msg.sender_id}-${msg.text}`)}
@@ -636,6 +664,40 @@
   .messages {
     flex: 1; overflow-y: auto; padding: 5px 8px;
     display: flex; flex-direction: column; gap: 2px;
+  }
+
+  .status-banner {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(120, 22, 22, 0.92);
+    color: #fff4f4;
+  }
+  .status-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    line-height: 1.45;
+    font-size: 0.88em;
+  }
+  .status-copy strong {
+    font-size: 0.95em;
+  }
+  .status-close {
+    flex-shrink: 0;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.08);
+    color: inherit;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    padding: 5px 10px;
+  }
+  .status-close:hover {
+    background: rgba(255, 255, 255, 0.16);
   }
   .messages::-webkit-scrollbar { width: 3px; }
   .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
