@@ -295,7 +295,7 @@
     const unlistenChat = await listen<ChatMessage>('chat-message', ({ payload: msg }) => {
       messages = [...messages.slice(-999), msg];
       if (autoScroll && listEl) setTimeout(() => { listEl!.scrollTop = listEl!.scrollHeight; }, 0);
-      speak(msg); checkKeywords(msg);
+      if (!s.blacklist.includes(msg.sender_name)) { speak(msg); checkKeywords(msg); }
     });
     const unlistenStatus = await listen<CaptureStatus>('capture-status', ({ payload }) => {
       captureStatus = payload;
