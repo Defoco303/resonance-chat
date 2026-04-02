@@ -140,19 +140,17 @@ fn emit_capture_status(handle: &AppHandle, error_text: &str) {
     let (code, message) = if lower.contains("access denied") {
         (
             "admin_required",
-            "管理者権限がないため、チャットの取得を開始できませんでした。インストーラー完了画面から起動した場合は一度アプリを閉じて、スタートメニューまたは EXE から起動し直してください。".to_string(),
+            "Administrator permission is required to start chat capture. Please relaunch the app as administrator.".to_string(),
         )
     } else if lower.contains("invalid handle") {
         (
             "capture_stopped",
-            "チャット取得が停止しました。アプリを再起動しても改善しない場合は、Windows を再起動してから再度お試しください。".to_string(),
+            "Chat capture stopped unexpectedly. Please relaunch the app or restart Windows and try again.".to_string(),
         )
     } else {
         (
             "capture_error",
-            format!(
-                "チャット取得の初期化に失敗しました。詳細: {error_text}"
-            ),
+            format!("Failed to initialize chat capture: {error_text}"),
         )
     };
 

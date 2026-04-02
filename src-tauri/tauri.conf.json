@@ -37,6 +37,11 @@
         "windows": {
             "webviewInstallMode": { "type": "downloadBootstrapper" },
             "nsis": {
+                "languages": ["Japanese"],
+                "customLanguageFiles": {
+                    "Japanese": "./windows/Japanese.nsh"
+                },
+                "template": "./windows/installer.nsi",
                 "installerHooks": "./installer-hooks.nsh"
             }
         }

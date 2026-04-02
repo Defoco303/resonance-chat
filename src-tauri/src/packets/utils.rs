@@ -1,7 +1,6 @@
-use byteorder::{BigEndian, ReadBytesExt};
+﻿use byteorder::{BigEndian, ReadBytesExt};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
-use std::io;
+use std::io::{self, Cursor, Read};
 
 #[inline]
 pub fn tcp_sequence_before(a: u32, b: u32) -> bool {

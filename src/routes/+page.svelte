@@ -1,4 +1,4 @@
-<script lang="ts">
+﻿<script lang="ts">
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { onMount } from 'svelte';
@@ -14,30 +14,26 @@
     message: string;
   }
 
-  const TABS = [
-    { id: 0, name: 'すべて' }, { id: 1, name: 'ワールド' },
-    { id: 2, name: 'チャンネル' }, { id: 3, name: 'パーティ' }, { id: 4, name: 'ギルド' },
-  ];
-
-  // TTS pills: ワールド → ギルド → パーティ → チャンネル
+  // TTS pills: ワールド -> ギルド -> パーティ -> チャンネル
   const CH_PILLS = [
-    { id: 1, name: 'ワールド', css: '--c-world'   },
-    { id: 4, name: 'ギルド',   css: '--c-guild'   },
-    { id: 3, name: 'パーティ', css: '--c-party'   },
-    { id: 2, name: 'チャンネル',css: '--c-channel' },
+    { id: 1, name: 'ワールド', css: '--c-world' },
+    { id: 4, name: 'ギルド', css: '--c-guild' },
+    { id: 3, name: 'パーティ', css: '--c-party' },
+    { id: 2, name: 'チャンネル', css: '--c-channel' },
   ] as const;
+  const DISPLAY_CHANNEL_IDS = CH_PILLS.map(({ id }) => id);
 
   const THEMES = [
-    { id: 'dark',     name: 'ダーク',   colors: ['#0d0d17', '#16163a', '#a78bfa'] },
-    { id: 'light',    name: 'ライト',   colors: ['#f8fafc', '#e2e8f0', '#7c3aed'] },
-    { id: 'oled',     name: 'OLED',    colors: ['#000000', '#080808', '#d8b4fe'] },
-    { id: 'cyber',    name: 'サイバー', colors: ['#00050f', '#000c1c', '#00ff88'] },
-    { id: 'sakura',   name: 'サクラ',   colors: ['#12050c', '#1e0814', '#f472b6'] },
+    { id: 'dark',     name: 'ダーク',       colors: ['#0d0d17', '#16163a', '#a78bfa'] },
+    { id: 'light',    name: 'ライト',       colors: ['#f8fafc', '#e2e8f0', '#7c3aed'] },
+    { id: 'oled',     name: 'OLED',        colors: ['#000000', '#080808', '#d8b4fe'] },
+    { id: 'cyber',    name: 'サイバー',     colors: ['#00050f', '#000c1c', '#00ff88'] },
+    { id: 'sakura',   name: 'サクラ',       colors: ['#12050c', '#1e0814', '#f472b6'] },
     { id: 'midnight', name: 'ミッドナイト', colors: ['#050819', '#0a0f2d', '#c4b5fd'] },
-    { id: 'nord',     name: 'ノルド',   colors: ['#242938', '#2e3448', '#b48ead'] },
+    { id: 'nord',     name: 'ノルド',       colors: ['#242938', '#2e3448', '#b48ead'] },
   ] as const;
 
-  // ─── Custom theme ──────────────────────────────────────
+  // Custom theme
   interface CustomTheme {
     bg: string; surface: string; border: string;
     text: string; textDim: string; accent: string;
@@ -49,11 +45,20 @@
     cWorld: '#a78bfa', cGuild: '#34d399', cParty: '#60a5fa', cChannel: '#e2e8f0',
   };
 
-  // ─── Settings ──────────────────────────────────────────
+  // Settings
+  type SplitMode = 1 | 2 | 3;
+  type PaneId = 'a' | 'b' | 'c';
+
   interface Settings {
     theme: string; fontSize: number; bgOpacity: number; alwaysOnTop: boolean;
     ttsEnabled: boolean; ttsRate: number; ttsVolume: number;
     ttsChannels: number[]; ttsVoice: string;
+    splitMode: SplitMode;
+    displayChannelsA: number[];
+    displayChannelsB: number[];
+    displayChannelsC: number[];
+    splitRatios2: number[];
+    splitRatios3: number[];
     notifyEnabled: boolean; notifyKeywords: string;
     notifyVolume: number; notifyHasCustomSound: boolean;
     customTheme: CustomTheme;
@@ -63,18 +68,28 @@
     theme: 'dark', fontSize: 13, bgOpacity: 0.92, alwaysOnTop: true,
     ttsEnabled: false, ttsRate: 1.0, ttsVolume: 0.8,
     ttsChannels: [1, 2, 3, 4], ttsVoice: '',
+    splitMode: 1,
+    displayChannelsA: [1, 2, 3, 4],
+    displayChannelsB: [1, 2, 3, 4],
+    displayChannelsC: [1, 2, 3, 4],
+    splitRatios2: [0.5, 0.5],
+    splitRatios3: [0.34, 0.33, 0.33],
     notifyEnabled: false, notifyKeywords: '', notifyVolume: 0.8, notifyHasCustomSound: false,
     customTheme: { ...DEFAULT_CUSTOM },
     blacklist: [],
   };
 
-  // ─── State ─────────────────────────────────────────────
+  // State
   let s          = $state<Settings>({ ...DEFAULTS, customTheme: { ...DEFAULT_CUSTOM } });
   let messages   = $state<ChatMessage[]>([]);
-  let activeTab  = $state(0);
   let panelOpen  = $state(false);
-  let listEl     = $state<HTMLElement | null>(null);
-  let autoScroll = $state(true);
+  let chatLayoutEl = $state<HTMLElement | null>(null);
+  let listElA    = $state<HTMLElement | null>(null);
+  let listElB    = $state<HTMLElement | null>(null);
+  let listElC    = $state<HTMLElement | null>(null);
+  let autoScrollA = $state(true);
+  let autoScrollB = $state(true);
+  let autoScrollC = $state(true);
   let voices     = $state<SpeechSynthesisVoice[]>([]);
   let soundFileName = $state('');
   let blockPopup = $state<{ name: string; x: number; y: number } | null>(null);
@@ -83,12 +98,18 @@
   let audioCtx: AudioContext | null = null;
   let captureStatus = $state<CaptureStatus | null>(null);
 
-  const filtered = $derived(
-    (activeTab === 0 ? messages : messages.filter(m => m.channel === activeTab))
-      .filter(m => !s.blacklist.includes(m.sender_name))
-  );
+  const SPLITTER_SIZE_PX = 10;
+  const MIN_PANE_HEIGHT_PX = 74;
+  let resizeDrag = $state<{
+    mode: 2 | 3;
+    splitterIndex: 0 | 1;
+    startY: number;
+    startRatios: number[];
+    availableHeight: number;
+  } | null>(null);
 
-  // ─── Theme helpers ─────────────────────────────────────
+
+  // Theme helpers
   function hexToRgb(hex: string) {
     const n = parseInt(hex.replace('#', ''), 16);
     return `${(n >> 16) & 255} ${(n >> 8) & 255} ${n & 255}`;
@@ -151,7 +172,7 @@
     });
   }
 
-  // ─── Audio ─────────────────────────────────────────────
+  // Audio
   function playBeep(volume: number) {
     try {
       if (!audioCtx) audioCtx = new AudioContext();
@@ -176,7 +197,7 @@
   function handleSoundFile(e: Event) {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (!file) return;
-    if (file.size > 3 * 1024 * 1024) { alert('ファイルサイズが大きすぎます（3MB以下推奨）'); return; }
+    if (file.size > 3 * 1024 * 1024) { alert('ファイルサイズが大きすぎます。3MB以下にしてください。'); return; }
     const reader = new FileReader();
     reader.onload = () => {
       try {
@@ -185,7 +206,7 @@
         notifyAudio = new Audio(data);
         soundFileName = file.name;
         s.notifyHasCustomSound = true; save();
-      } catch { alert('保存に失敗しました。'); }
+      } catch { alert('読み込みに失敗しました。'); }
     };
     reader.readAsDataURL(file);
   }
@@ -196,20 +217,39 @@
     s.notifyHasCustomSound = false; save();
   }
 
-  // ─── Text helpers ──────────────────────────────────────
+  // Text helpers
   function isStamp(text: string) { return text.startsWith('emojiPic='); }
   function stripSprites(text: string) { return text.replace(/<sprite=\d+>/g, '').trim(); }
   function displayText(text: string) { return isStamp(text) ? null : stripSprites(text); }
 
+  function getKeywords(): string[] {
+    if (!s.notifyEnabled || !s.notifyKeywords.trim()) return [];
+    return s.notifyKeywords.split(/[\n,、]/).map(k => k.trim()).filter(k => k);
+  }
+
+  function escapeHtml(text: string): string {
+    return text.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]!));
+  }
+
+  function highlightKeywords(text: string): string {
+    const kws = getKeywords();
+    if (!kws.length) return escapeHtml(text);
+    const pattern = kws.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const re = new RegExp(`(${pattern})`, 'gi');
+    return text.split(re).map((part, i) =>
+      i % 2 === 1 ? `<mark class="kw-hl">${escapeHtml(part)}</mark>` : escapeHtml(part)
+    ).join('');
+  }
+
   function checkKeywords(msg: ChatMessage) {
     if (!s.notifyEnabled || !s.notifyKeywords.trim()) return;
     if (isStamp(msg.text)) return;
-    const kws = s.notifyKeywords.split(/[\n,、]/).map(k => k.trim()).filter(k => k);
+    const kws = getKeywords();
     const clean = stripSprites(msg.text);
-    if (kws.some(kw => clean.includes(kw) || msg.sender_name.includes(kw))) playNotification();
+    if (kws.some(kw => clean.includes(kw))) playNotification();
   }
 
-  // ─── TTS ───────────────────────────────────────────────
+  // TTS
   function speak(msg: ChatMessage) {
     if (!s.ttsEnabled || !s.ttsChannels.includes(msg.channel)) return;
     if (!('speechSynthesis' in window)) return;
@@ -236,6 +276,152 @@
     save();
   }
 
+  function filterMessages(channels: number[]) {
+    return messages
+      .filter(m => channels.includes(m.channel))
+      .filter(m => !s.blacklist.includes(m.sender_name));
+  }
+
+  const filteredPrimary = $derived(filterMessages(s.displayChannelsA));
+  const filteredSecondary = $derived(filterMessages(s.displayChannelsB));
+  const filteredTertiary = $derived(filterMessages(s.displayChannelsC));
+
+  function normalizeDisplayChannels(raw: number[] | undefined) {
+    if (!Array.isArray(raw)) return [...DISPLAY_CHANNEL_IDS];
+    return DISPLAY_CHANNEL_IDS.filter(id => raw.includes(id));
+  }
+
+  function normalizeRatios(raw: number[], paneCount: 2 | 3) {
+    const fallback = paneCount === 2 ? DEFAULTS.splitRatios2 : DEFAULTS.splitRatios3;
+    const source = Array.isArray(raw) && raw.length === paneCount ? raw : fallback;
+    const values = source.map(value => Number.isFinite(value) && value > 0 ? value : 0);
+    const sum = values.reduce((acc, value) => acc + value, 0);
+    if (sum <= 0) return [...fallback];
+    return values.map(value => value / sum);
+  }
+
+  function getPaneRatios(mode: 2 | 3) {
+    return mode === 2 ? normalizeRatios(s.splitRatios2, 2) : normalizeRatios(s.splitRatios3, 3);
+  }
+
+  function setPaneRatios(mode: 2 | 3, ratios: number[]) {
+    const normalized = normalizeRatios(ratios, mode);
+    if (mode === 2) {
+      s.splitRatios2 = normalized;
+    } else {
+      s.splitRatios3 = normalized;
+    }
+  }
+
+  const gridTemplateRows = $derived.by(() => {
+    if (s.splitMode === 1) return 'minmax(0, 1fr)';
+    const mode = s.splitMode === 3 ? 3 : 2;
+    const ratios = getPaneRatios(mode);
+    return ratios
+      .map((ratio, index) => (index > 0 ? String(SPLITTER_SIZE_PX) + 'px ' : '') + 'minmax(' + MIN_PANE_HEIGHT_PX + 'px, ' + ratio + 'fr)')
+      .join(' ');
+  });
+
+  function getDisplayChannels(pane: PaneId) {
+    switch (pane) {
+      case 'a': return s.displayChannelsA;
+      case 'b': return s.displayChannelsB;
+      case 'c': return s.displayChannelsC;
+    }
+  }
+
+  function setDisplayChannels(pane: PaneId, channels: number[]) {
+    const ordered = normalizeDisplayChannels(channels);
+    if (pane === 'a') {
+      s.displayChannelsA = ordered;
+    } else if (pane === 'b') {
+      s.displayChannelsB = ordered;
+    } else {
+      s.displayChannelsC = ordered;
+    }
+  }
+
+  function isAllDisplaySelected(channels: number[]) {
+    return DISPLAY_CHANNEL_IDS.every(id => channels.includes(id));
+  }
+
+  function selectAllDisplayChannels(pane: PaneId) {
+    setDisplayChannels(pane, [...DISPLAY_CHANNEL_IDS]);
+    save();
+  }
+
+  function toggleDisplayChannel(pane: PaneId, id: number) {
+    const current = getDisplayChannels(pane);
+    const next = current.includes(id)
+      ? current.filter(c => c !== id)
+      : [...current, id];
+    setDisplayChannels(pane, next);
+    save();
+  }
+
+  function cycleSplitMode() {
+    endResize();
+    const nextMode: SplitMode = s.splitMode === 1 ? 2 : s.splitMode === 2 ? 3 : 1;
+    if (nextMode >= 2 && s.displayChannelsB.length === 0) {
+      s.displayChannelsB = [...DISPLAY_CHANNEL_IDS];
+    }
+    if (nextMode === 3 && s.displayChannelsC.length === 0) {
+      s.displayChannelsC = [...DISPLAY_CHANNEL_IDS];
+    }
+    if (nextMode === 2) {
+      setPaneRatios(2, s.splitRatios2);
+    } else if (nextMode === 3) {
+      setPaneRatios(3, s.splitRatios3);
+    }
+    s.splitMode = nextMode;
+    save();
+  }
+
+  function beginResize(splitterIndex: 0 | 1, event: PointerEvent) {
+    const mode = s.splitMode;
+    if ((mode !== 2 && mode !== 3) || !chatLayoutEl) return;
+    event.preventDefault();
+    const availableHeight = chatLayoutEl.clientHeight - (mode - 1) * SPLITTER_SIZE_PX;
+    if (availableHeight <= MIN_PANE_HEIGHT_PX * mode) return;
+    resizeDrag = {
+      mode,
+      splitterIndex,
+      startY: event.clientY,
+      startRatios: getPaneRatios(mode),
+      availableHeight,
+    };
+    document.body.classList.add('split-resizing');
+    window.addEventListener('pointermove', handleResizeMove);
+    window.addEventListener('pointerup', endResize);
+    window.addEventListener('pointercancel', endResize);
+  }
+
+  function handleResizeMove(event: PointerEvent) {
+    if (!resizeDrag) return;
+    event.preventDefault();
+    const next = [...resizeDrag.startRatios];
+    const leftIndex = resizeDrag.splitterIndex;
+    const rightIndex = leftIndex + 1;
+    const pairTotal = resizeDrag.startRatios[leftIndex] + resizeDrag.startRatios[rightIndex];
+    const minRatio = MIN_PANE_HEIGHT_PX / resizeDrag.availableHeight;
+    const nextLeft = Math.min(
+      pairTotal - minRatio,
+      Math.max(minRatio, resizeDrag.startRatios[leftIndex] + (event.clientY - resizeDrag.startY) / resizeDrag.availableHeight)
+    );
+    next[leftIndex] = nextLeft;
+    next[rightIndex] = pairTotal - nextLeft;
+    setPaneRatios(resizeDrag.mode, next);
+  }
+
+  function endResize() {
+    if (!resizeDrag) return;
+    resizeDrag = null;
+    document.body.classList.remove('split-resizing');
+    window.removeEventListener('pointermove', handleResizeMove);
+    window.removeEventListener('pointerup', endResize);
+    window.removeEventListener('pointercancel', endResize);
+    save();
+  }
   function showBlockPopup(e: MouseEvent, name: string) {
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -261,20 +447,56 @@
     save();
   }
 
-  function onScroll() {
-    if (!listEl) return;
-    autoScroll = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 80;
+  function getListEl(which: PaneId) {
+    if (which === 'a') return listElA;
+    if (which === 'b') return listElB;
+    return listElC;
   }
-  function scrollBottom() { if (listEl) { listEl.scrollTop = listEl.scrollHeight; autoScroll = true; } }
 
-  // ─── Mount ─────────────────────────────────────────────
+  function setAutoScroll(which: PaneId, value: boolean) {
+    if (which === 'a') {
+      autoScrollA = value;
+    } else if (which === 'b') {
+      autoScrollB = value;
+    } else {
+      autoScrollC = value;
+    }
+  }
+
+  function onScroll(which: PaneId) {
+    const el = getListEl(which);
+    if (!el) return;
+    setAutoScroll(which, el.scrollHeight - el.scrollTop - el.clientHeight < 80);
+  }
+
+  function scrollBottom(which: PaneId) {
+    const el = getListEl(which);
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setAutoScroll(which, true);
+  }
+
+  // Mount
   onMount(async () => {
     try {
       const saved = localStorage.getItem('rchat');
       if (saved) {
         const parsed = JSON.parse(saved);
-        s = { ...DEFAULTS, customTheme: { ...DEFAULT_CUSTOM }, ...parsed,
-              customTheme: { ...DEFAULT_CUSTOM, ...(parsed.customTheme ?? {}) } };
+        const splitMode: SplitMode = parsed.splitMode === 2 || parsed.splitMode === 3 || parsed.splitMode === 1
+          ? parsed.splitMode
+          : parsed.splitView ? 2 : 1;
+        s = {
+          ...DEFAULTS,
+          customTheme: { ...DEFAULT_CUSTOM },
+          ...parsed,
+          splitMode,
+          displayChannelsA: normalizeDisplayChannels(parsed.displayChannelsA),
+          displayChannelsB: normalizeDisplayChannels(parsed.displayChannelsB),
+          displayChannelsC: normalizeDisplayChannels(parsed.displayChannelsC),
+          splitRatios2: normalizeRatios(parsed.splitRatios2, 2),
+          splitRatios3: normalizeRatios(parsed.splitRatios3, 3),
+          customTheme: { ...DEFAULT_CUSTOM, ...(parsed.customTheme ?? {}) },
+        };
       }
     } catch {}
     applyCSS(s);
@@ -294,7 +516,9 @@
     }
     const unlistenChat = await listen<ChatMessage>('chat-message', ({ payload: msg }) => {
       messages = [...messages.slice(-999), msg];
-      if (autoScroll && listEl) setTimeout(() => { listEl!.scrollTop = listEl!.scrollHeight; }, 0);
+      if (autoScrollA && listElA) setTimeout(() => { listElA!.scrollTop = listElA!.scrollHeight; }, 0);
+      if (autoScrollB && listElB) setTimeout(() => { listElB!.scrollTop = listElB!.scrollHeight; }, 0);
+      if (autoScrollC && listElC) setTimeout(() => { listElC!.scrollTop = listElC!.scrollHeight; }, 0);
       if (!s.blacklist.includes(msg.sender_name)) { speak(msg); checkKeywords(msg); }
     });
     const unlistenStatus = await listen<CaptureStatus>('capture-status', ({ payload }) => {
@@ -307,24 +531,26 @@
   });
 </script>
 
-<!-- ────────── MARKUP ────────── -->
+<!-- MARKUP -->
 <div class="app" onclick={() => { blockPopup = null; }}>
   <header class="header">
-    <nav class="tabs">
-      {#each TABS as tab}
-        <button class="tab" class:active={activeTab === tab.id}
-          style:--tc={tab.id === 0 ? 'var(--accent)' : chColorById(tab.id)}
-          onclick={() => { activeTab = tab.id; }}>{tab.name}</button>
-      {/each}
-    </nav>
-    <button class="gear" class:active={panelOpen}
-      onclick={() => { panelOpen = !panelOpen; }} title="設定">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-        stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-      </svg>
-    </button>
+    <div class="header-title">チャット</div>
+    <div class="header-actions">
+      <button
+        class="pill split-toggle"
+        class:on={s.splitMode > 1}
+        style:--pc={'var(--accent)'}
+        onclick={cycleSplitMode}
+      >分割</button>
+      <button class="gear" class:active={panelOpen}
+        onclick={() => { panelOpen = !panelOpen; }} title="設定">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
   </header>
 
   {#if captureStatus}
@@ -336,45 +562,167 @@
       <button
         class="status-close"
         type="button"
-        aria-label="警告を閉じる"
+        aria-label="閉じる"
         onclick={() => { captureStatus = null; }}
       >閉じる</button>
     </div>
   {/if}
 
-  <div class="messages" bind:this={listEl} onscroll={onScroll}>
-    {#each filtered as msg (`${msg.timestamp}-${msg.sender_id}-${msg.text}`)}
-      <div class="msg">
-        <span class="time">{fmt(msg.timestamp)}</span>
-        <span class="badge" style:color={chColorById(msg.channel)}>[{msg.channel_name}]</span>
-        <span class="name clickable-name" onclick={(e) => showBlockPopup(e, msg.sender_name)}>{msg.sender_name}</span>
-        <span class="sep">›</span>
-        {#if isStamp(msg.text)}
-          <span class="body stamp">🖼 スタンプ</span>
-        {:else}
-          <span class="body">{stripSprites(msg.text)}</span>
-        {/if}
+  <div
+    class="chat-layout"
+    class:split={s.splitMode > 1}
+    class:triple={s.splitMode === 3}
+    bind:this={chatLayoutEl}
+    style:grid-template-rows={gridTemplateRows}
+  >
+    <section class="message-pane">
+      <div class="filter-bar">
+        <div class="ch-pills">
+          <button class="pill" class:on={isAllDisplaySelected(s.displayChannelsA)} style:--pc={'var(--accent)'}
+            onclick={() => selectAllDisplayChannels('a')}>すべて</button>
+          {#each CH_PILLS as ch}
+            <button class="pill" class:on={s.displayChannelsA.includes(ch.id)}
+              style:--pc={`var(${ch.css})`}
+              onclick={() => toggleDisplayChannel('a', ch.id)}>{ch.name}</button>
+          {/each}
+        </div>
       </div>
-    {:else}
-      <div class="empty">
-        <div class="empty-icon">💬</div>
-        <div>チャットを待機中...</div>
-        <div class="empty-sub">ゲームにログインするか、ch変更すると受信が始まります</div>
-      </div>
-    {/each}
-  </div>
 
+      <div class="messages" bind:this={listElA} onscroll={() => onScroll('a')}>
+        {#each filteredPrimary as msg (`${msg.timestamp}-${msg.sender_id}-${msg.text}`)}
+          <div class="msg">
+            <span class="time">{fmt(msg.timestamp)}</span>
+            <span class="badge" style:color={chColorById(msg.channel)}>[{msg.channel_name}]</span>
+            <span class="name clickable-name" onclick={(e) => showBlockPopup(e, msg.sender_name)}>{msg.sender_name}</span>
+            <span class="sep">›</span>
+            {#if isStamp(msg.text)}
+              <span class="body stamp">スタンプ</span>
+            {:else}
+              <span class="body">{@html highlightKeywords(stripSprites(msg.text))}</span>
+            {/if}
+          </div>
+        {:else}
+          <div class="empty">
+            <div class="empty-icon">💬</div>
+            <div>チャットを受信中...</div>
+            <div class="empty-sub">表示対象に入ったメッセージが届くとここに流れます</div>
+          </div>
+        {/each}
+      </div>
+
+      {#if !autoScrollA}
+        <button class="scroll-fab" onclick={() => scrollBottom('a')}>最新へ</button>
+      {/if}
+    </section>
+
+    {#if s.splitMode > 1}
+      <div
+        class="splitter"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="ペインの高さを調整"
+        onpointerdown={(e) => beginResize(0, e)}
+      ></div>
+
+      <section class="message-pane split">
+        <div class="filter-bar">
+          <div class="ch-pills">
+            <button class="pill" class:on={isAllDisplaySelected(s.displayChannelsB)} style:--pc={'var(--accent)'}
+              onclick={() => selectAllDisplayChannels('b')}>すべて</button>
+            {#each CH_PILLS as ch}
+              <button class="pill" class:on={s.displayChannelsB.includes(ch.id)}
+                style:--pc={`var(${ch.css})`}
+                onclick={() => toggleDisplayChannel('b', ch.id)}>{ch.name}</button>
+            {/each}
+          </div>
+        </div>
+
+        <div class="messages" bind:this={listElB} onscroll={() => onScroll('b')}>
+          {#each filteredSecondary as msg (`${msg.timestamp}-${msg.sender_id}-${msg.text}`)}
+            <div class="msg">
+              <span class="time">{fmt(msg.timestamp)}</span>
+              <span class="badge" style:color={chColorById(msg.channel)}>[{msg.channel_name}]</span>
+              <span class="name clickable-name" onclick={(e) => showBlockPopup(e, msg.sender_name)}>{msg.sender_name}</span>
+              <span class="sep">›</span>
+              {#if isStamp(msg.text)}
+                <span class="body stamp">スタンプ</span>
+              {:else}
+                <span class="body">{@html highlightKeywords(stripSprites(msg.text))}</span>
+              {/if}
+            </div>
+          {:else}
+            <div class="empty">
+              <div class="empty-icon">💬</div>
+              <div>チャットを受信中...</div>
+              <div class="empty-sub">表示対象に入ったメッセージが届くとここに流れます</div>
+            </div>
+          {/each}
+        </div>
+
+        {#if !autoScrollB}
+          <button class="scroll-fab" onclick={() => scrollBottom('b')}>最新へ</button>
+        {/if}
+      </section>
+    {/if}
+
+    {#if s.splitMode === 3}
+      <div
+        class="splitter"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="ペインの高さを調整"
+        onpointerdown={(e) => beginResize(1, e)}
+      ></div>
+
+      <section class="message-pane split">
+        <div class="filter-bar">
+          <div class="ch-pills">
+            <button class="pill" class:on={isAllDisplaySelected(s.displayChannelsC)} style:--pc={'var(--accent)'}
+              onclick={() => selectAllDisplayChannels('c')}>すべて</button>
+            {#each CH_PILLS as ch}
+              <button class="pill" class:on={s.displayChannelsC.includes(ch.id)}
+                style:--pc={`var(${ch.css})`}
+                onclick={() => toggleDisplayChannel('c', ch.id)}>{ch.name}</button>
+            {/each}
+          </div>
+        </div>
+
+        <div class="messages" bind:this={listElC} onscroll={() => onScroll('c')}>
+          {#each filteredTertiary as msg (`${msg.timestamp}-${msg.sender_id}-${msg.text}`)}
+            <div class="msg">
+              <span class="time">{fmt(msg.timestamp)}</span>
+              <span class="badge" style:color={chColorById(msg.channel)}>[{msg.channel_name}]</span>
+              <span class="name clickable-name" onclick={(e) => showBlockPopup(e, msg.sender_name)}>{msg.sender_name}</span>
+              <span class="sep">›</span>
+              {#if isStamp(msg.text)}
+                <span class="body stamp">スタンプ</span>
+              {:else}
+                <span class="body">{@html highlightKeywords(stripSprites(msg.text))}</span>
+              {/if}
+            </div>
+          {:else}
+            <div class="empty">
+              <div class="empty-icon">💬</div>
+              <div>チャットを受信中...</div>
+              <div class="empty-sub">表示対象に入ったメッセージが届くとここに流れます</div>
+            </div>
+          {/each}
+        </div>
+
+        {#if !autoScrollC}
+          <button class="scroll-fab" onclick={() => scrollBottom('c')}>最新へ</button>
+        {/if}
+      </section>
+    {/if}
+  </div>
   {#if blockPopup}
     <div class="block-popup" style:left="{blockPopup.x}px" style:top="{blockPopup.y}px"
       onclick={(e) => e.stopPropagation()}>
       <span class="block-popup-name">{blockPopup.name}</span>
-      <button class="block-btn" onclick={() => blockUser(blockPopup!.name)}>🚫 ブロック</button>
+      <button class="block-btn" onclick={() => blockUser(blockPopup!.name)}>ブロック</button>
     </div>
   {/if}
 
-  {#if !autoScroll}
-    <button class="scroll-fab" onclick={scrollBottom}>↓ 最新へ</button>
-  {/if}
 
   {#if panelOpen}
     <div class="backdrop" onclick={() => { panelOpen = false; }}></div>
@@ -383,14 +731,14 @@
   <aside class="panel" class:open={panelOpen}>
     <div class="panel-head">
       <span>設定</span>
-      <button class="close-btn" onclick={() => { panelOpen = false; }}>✕</button>
+      <button class="close-btn" onclick={() => { panelOpen = false; }}>×</button>
     </div>
     <div class="panel-body">
 
       <!-- Theme -->
       <section class="sect">
         <h4 class="sect-title">テーマ</h4>
-        <!-- 4×2 grid: 7 presets + 1 custom -->
+        <!-- 4x2 grid: 7 presets + 1 custom -->
         <div class="theme-grid">
           {#each THEMES as th}
             <button class="theme-btn" class:sel={s.theme === th.id}
@@ -527,8 +875,8 @@
         {#if s.notifyEnabled}
           <div class="tts-sub">
             <div class="subsect">
-              <span class="sublabel">監視キーワード（1行または , で区切り）</span>
-              <textarea class="kw-area" placeholder={"例：ボス\nアリーナ\n救援"}
+              <span class="sublabel">通知キーワードを入力してください。改行かカンマで区切れます。</span>
+              <textarea class="kw-area" placeholder={"ボス\nアリーナ\n通知ワード"}
                 bind:value={s.notifyKeywords} oninput={save} rows="4"></textarea>
             </div>
             <div class="subsect">
@@ -543,15 +891,15 @@
                   <span class="sound-name">{soundFileName}</span>
                   <button class="mini-btn danger" onclick={clearCustomSound}>削除</button>
                 {:else}
-                  <span class="sound-name dim">デフォルト（ビープ音）</span>
+                  <span class="sound-name dim">デフォルト音を使用します</span>
                 {/if}
-                <label class="mini-btn file-label">ファイル選択
+                <label class="mini-btn file-label">ファイルを選択
                   <input type="file" accept="audio/*" class="hidden-file" onchange={handleSoundFile} />
                 </label>
               </div>
             </div>
             <div class="btn-row">
-              <button class="test-btn" onclick={playNotification}>▶ テスト再生</button>
+              <button class="test-btn" onclick={playNotification}>テスト再生</button>
             </div>
           </div>
         {/if}
@@ -599,7 +947,7 @@
               </div>
             {/if}
             <div class="btn-row">
-              <button class="test-btn" onclick={testTts}>▶ テスト再生</button>
+              <button class="test-btn" onclick={testTts}>テスト再生</button>
             </div>
           </div>
         {/if}
@@ -609,7 +957,7 @@
       <section class="sect">
         <h4 class="sect-title">ブラックリスト <em>{s.blacklist.length}</em></h4>
         {#if s.blacklist.length === 0}
-          <p class="bl-empty">登録なし。名前をクリックして追加できます</p>
+          <p class="bl-empty">非表示ユーザーはいません。名前をクリックすると追加できます。</p>
         {:else}
           <div class="bl-tags">
             {#each s.blacklist as name}
@@ -626,7 +974,7 @@
   </aside>
 </div>
 
-<!-- ────────── STYLES ────────── -->
+<!-- STYLES -->
 <style>
   .app {
     display: flex; flex-direction: column; height: 100vh;
@@ -634,7 +982,7 @@
     position: relative; overflow: hidden;
   }
 
-  /* ── Header ── */
+  /* Header */
   .header {
     display: flex; align-items: center;
     background: rgb(var(--surface) / 0.97);
@@ -660,7 +1008,7 @@
   .gear:hover  { color: var(--accent); background: rgb(var(--bg) / 0.5); }
   .gear.active { color: var(--accent); transform: rotate(60deg); }
 
-  /* ── Messages ── */
+  /* Messages */
   .messages {
     flex: 1; overflow-y: auto; padding: 5px 8px;
     display: flex; flex-direction: column; gap: 2px;
@@ -714,6 +1062,11 @@
   .sep   { color: var(--text-dim); flex-shrink: 0; }
   .body  { color: var(--text); word-break: break-word; }
   .body.stamp { font-style: italic; font-size: 0.88em; }
+  .body :global(.kw-hl) {
+    background: var(--accent); color: #000;
+    border-radius: 2px; padding: 0 2px;
+    font-weight: 700;
+  }
 
   .empty { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-top: 60px; color: var(--text); text-align: center; }
   .empty-icon { font-size: 2em; }
@@ -728,7 +1081,7 @@
   }
   .scroll-fab:hover { transform: translateY(-1px); box-shadow: 0 4px 16px var(--accent-glow); }
 
-  /* ── Panel ── */
+  /* Panel */
   .backdrop { position: absolute; inset: 0; background: rgba(0 0 0 / 0.22); backdrop-filter: blur(2px); z-index: 9; }
   .panel {
     position: absolute; top: 0; right: 0; bottom: 0; width: min(280px, 92vw);
@@ -754,13 +1107,13 @@
   .panel-body::-webkit-scrollbar { width: 3px; }
   .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  /* ── Sections ── */
+  /* Sections */
   .sect { padding: 11px 14px; border-bottom: 1px solid var(--border); }
   .sect:last-child { border-bottom: none; }
   .sect-title { font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin-bottom: 9px; }
   .sect-title em { font-style: normal; color: var(--accent); margin-left: 6px; }
 
-  /* ── Theme grid ── */
+  /* Theme grid */
   .theme-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr)); /* minmax(0,1fr) prevents content from bloating cells */
@@ -785,7 +1138,7 @@
   .th-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
   .th-name {
     font-size: 0.68em; color: var(--text-dim);
-    /* fixed single-line — prevent text length from altering button height */
+    /* fixed single-line to prevent text length from altering button height */
     width: 100%; text-align: center;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     line-height: 1.2;
@@ -831,7 +1184,7 @@
   }
   .reset-btn:hover { border-color: var(--accent); color: var(--accent); }
 
-  /* ── Slider ── */
+  /* Slider */
   .slider {
     -webkit-appearance: none; appearance: none;
     width: 100%; height: 4px; background: var(--border);
@@ -846,7 +1199,7 @@
   .slider::-webkit-slider-thumb:hover { transform: scale(1.25); box-shadow: 0 0 10px var(--accent-glow); }
   .range-labels { display: flex; justify-content: space-between; font-size: 0.74em; color: var(--text-dim); margin-top: 1px; }
 
-  /* ── Toggle ── */
+  /* Toggle */
   .toggle-row { display: flex; align-items: center; justify-content: space-between; cursor: pointer; gap: 8px; }
   .toggle-label { font-size: 0.9em; color: var(--text); flex: 1; }
   .tog {
@@ -861,14 +1214,14 @@
   }
   .tog.on .tog-knob { transform: translateX(20px); }
 
-  /* ── Sub-sections ── */
+  /* Sub-sections */
   .tts-sub { margin-top: 10px; display: flex; flex-direction: column; gap: 11px; }
   .subsect { display: flex; flex-direction: column; gap: 5px; }
   .sublabel { font-size: 0.79em; color: var(--text-dim); }
   .sublabel em { font-style: normal; color: var(--accent); margin-left: 4px; }
 
-  /* ── Channel pills ── */
-  .ch-pills { display: flex; flex-wrap: wrap; gap: 5px; }
+  /* Channel pills */
+  .ch-pills { display: flex; flex-wrap: wrap; gap: 5px; flex: 1; min-width: 0; }
   .pill {
     padding: 3px 10px; border-radius: 20px; border: 1.5px solid var(--border);
     background: none; cursor: pointer; font: inherit; font-size: 0.8em; color: var(--text-dim);
@@ -876,7 +1229,7 @@
   }
   .pill.on { border-color: var(--pc); color: var(--pc); font-weight: 700; }
 
-  /* ── Keyword textarea ── */
+  /* Keyword textarea */
   .kw-area {
     width: 100%; padding: 7px 8px; resize: vertical;
     background: var(--input-bg); border: 1px solid var(--border);
@@ -886,7 +1239,7 @@
   .kw-area:focus { border-color: var(--accent); }
   .kw-area::placeholder { color: var(--text-dim); }
 
-  /* ── Sound file ── */
+  /* Sound file */
   .sound-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .sound-name { font-size: 0.8em; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sound-name.dim { color: var(--text-dim); }
@@ -901,7 +1254,7 @@
   .file-label { cursor: pointer; }
   .hidden-file { display: none; }
 
-  /* ── Voice / buttons ── */
+  /* Voice / buttons */
   .sel-voice {
     width: 100%; padding: 6px 8px;
     background: var(--input-bg); border: 1px solid var(--border);
@@ -916,14 +1269,14 @@
   }
   .test-btn:hover { background: rgb(var(--surface) / 0.8); border-color: var(--accent); }
 
-  /* ── Clickable name ── */
+  /* Clickable name */
   .clickable-name {
     cursor: pointer; border-radius: 3px;
     transition: color 0.12s, background 0.12s;
   }
   .clickable-name:hover { color: var(--accent); background: rgb(var(--surface) / 0.6); }
 
-  /* ── Block popup ── */
+  /* Block popup */
   .block-popup {
     position: fixed; z-index: 100;
     background: rgb(var(--surface) / 0.97); border: 1px solid var(--border);
@@ -944,7 +1297,7 @@
   }
   .block-btn:hover { background: rgba(248,113,113,0.22); }
 
-  /* ── Blacklist tags ── */
+  /* Blacklist tags */
   .bl-empty { font-size: 0.8em; color: var(--text-dim); margin: 0; }
   .bl-tags { display: flex; flex-wrap: wrap; gap: 5px; }
   .bl-tag {
@@ -960,4 +1313,85 @@
     transition: color 0.12s;
   }
   .bl-remove:hover { color: #f87171; }
+  .header-title {
+    padding: 0 10px;
+    color: var(--accent);
+    font-size: 0.84em;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .header-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 4px 4px 0;
+  }
+
+  .split-toggle {
+    flex-shrink: 0;
+    min-width: 48px;
+  }
+
+  .chat-layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    overflow: hidden;
+  }
+
+  .chat-layout.split {
+    gap: 0;
+  }
+
+  .message-pane {
+    position: relative;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .splitter {
+    position: relative;
+    cursor: row-resize;
+    background: rgb(var(--surface) / 0.92);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .splitter::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 54px;
+    height: 2px;
+    transform: translate(-50%, -50%);
+    border-radius: 999px;
+    background: rgb(var(--bg) / 0.45);
+  }
+
+  .splitter:hover {
+    background: rgb(var(--surface) / 1);
+  }
+
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    background: rgb(var(--surface) / 0.88);
+  }
+
+  :global(body.split-resizing) {
+    user-select: none;
+    cursor: row-resize;
+  }
 </style>
+
+

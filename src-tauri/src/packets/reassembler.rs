@@ -1,4 +1,4 @@
-use std::convert::TryInto;
+﻿use std::convert::TryInto;
 
 pub struct Reassembler {
     buffer: Vec<u8>,
@@ -82,5 +82,4 @@ impl Reassembler {
         }
         self.buffer.extend_from_slice(&bytes);
     }
-
 }
