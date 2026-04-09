@@ -1,4 +1,11 @@
 ﻿<script lang="ts">
+  import {
+    DEFAULT_AIVIS_URL,
+    fetchAivisStyles,
+    speakWithAivis,
+    stopAivisPlayback,
+    type AivisStyle,
+  } from '$lib/aivis';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { onMount } from 'svelte';
@@ -48,11 +55,36 @@
   // Settings
   type SplitMode = 1 | 2 | 3;
   type PaneId = 'a' | 'b' | 'c';
+  type TtsProvider = 'aivis' | 'system';
+  type TtsPlaybackMode = 'interrupt' | 'queue' | 'latest_after_current';
+  type PanelKind = 'general' | 'tts' | 'speaker' | 'dictionary';
+
+  type TtsDictionaryEntry = {
+    id: string;
+    from: string;
+    to: string;
+  };
+
+  type TtsSpeakerVoiceEntry = {
+    id: string;
+    speakerName: string;
+    styleId: string;
+    styleLabel: string;
+  };
+
+  type QueuedSpeech = {
+    text: string;
+    speakerName?: string;
+  };
 
   interface Settings {
     theme: string; fontSize: number; bgOpacity: number; alwaysOnTop: boolean;
+    ttsProvider: TtsProvider;
+    ttsPlaybackMode: TtsPlaybackMode;
     ttsEnabled: boolean; ttsRate: number; ttsVolume: number;
-    ttsChannels: number[]; ttsVoice: string;
+    ttsChannels: number[]; ttsVoice: string; ttsSystemVoice: string; ttsEngineUrl: string;
+    ttsDictionary: TtsDictionaryEntry[];
+    ttsSpeakerVoices: TtsSpeakerVoiceEntry[];
     splitMode: SplitMode;
     displayChannelsA: number[];
     displayChannelsB: number[];
@@ -66,8 +98,12 @@
   }
   const DEFAULTS: Settings = {
     theme: 'dark', fontSize: 13, bgOpacity: 0.92, alwaysOnTop: true,
+    ttsProvider: 'system',
+    ttsPlaybackMode: 'interrupt',
     ttsEnabled: false, ttsRate: 1.0, ttsVolume: 0.8,
-    ttsChannels: [1, 2, 3, 4], ttsVoice: '',
+    ttsChannels: [1, 2, 3, 4], ttsVoice: '', ttsSystemVoice: '', ttsEngineUrl: DEFAULT_AIVIS_URL,
+    ttsDictionary: [],
+    ttsSpeakerVoices: [],
     splitMode: 1,
     displayChannelsA: [1, 2, 3, 4],
     displayChannelsB: [1, 2, 3, 4],
@@ -83,6 +119,7 @@
   let s          = $state<Settings>({ ...DEFAULTS, customTheme: { ...DEFAULT_CUSTOM } });
   let messages   = $state<ChatMessage[]>([]);
   let panelOpen  = $state(false);
+  let panelKind  = $state<PanelKind>('general');
   let chatLayoutEl = $state<HTMLElement | null>(null);
   let listElA    = $state<HTMLElement | null>(null);
   let listElB    = $state<HTMLElement | null>(null);
@@ -90,13 +127,79 @@
   let autoScrollA = $state(true);
   let autoScrollB = $state(true);
   let autoScrollC = $state(true);
-  let voices     = $state<SpeechSynthesisVoice[]>([]);
+  let aivisStyles = $state<AivisStyle[]>([]);
+  let systemVoices = $state<SpeechSynthesisVoice[]>([]);
+  let ttsStatusMessage = $state('');
+  let ttsStatusError = $state(false);
+  let ttsLoadingVoices = $state(false);
+  let ttsQueue = $state<QueuedSpeech[]>([]);
+  let ttsQueueRunning = $state(false);
+  let ttsQueueRevision = $state(0);
+  let ttsDictionaryDraftFrom = $state('');
+  let ttsDictionaryDraftTo = $state('');
+  let ttsSpeakerDraftName = $state('');
+  let ttsSpeakerDraftStyleId = $state('');
   let soundFileName = $state('');
   let blockPopup = $state<{ name: string; x: number; y: number } | null>(null);
 
   let notifyAudio: HTMLAudioElement | null = null;
   let audioCtx: AudioContext | null = null;
   let captureStatus = $state<CaptureStatus | null>(null);
+
+  function togglePanel(kind: PanelKind) {
+    if (panelOpen && panelKind === kind) {
+      panelOpen = false;
+      return;
+    }
+    panelKind = kind;
+    panelOpen = true;
+    blockPopup = null;
+    if (kind === 'speaker') {
+      if (!aivisStyles.length) {
+        void refreshAivisVoices();
+      } else if (!ttsSpeakerDraftStyleId || !hasAivisStyle(ttsSpeakerDraftStyleId)) {
+        ttsSpeakerDraftStyleId = String(aivisStyles[0].id);
+      }
+    }
+  }
+
+  function closePanel() {
+    panelOpen = false;
+  }
+
+  function createTtsDictionaryId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function normalizeTtsDictionary(raw: unknown): TtsDictionaryEntry[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object') return [];
+      const item = entry as Partial<TtsDictionaryEntry>;
+      return [{
+        id: typeof item.id === 'string' && item.id ? item.id : createTtsDictionaryId(),
+        from: typeof item.from === 'string' ? item.from : '',
+        to: typeof item.to === 'string' ? item.to : '',
+      }];
+    });
+  }
+
+  function normalizeTtsSpeakerVoices(raw: unknown): TtsSpeakerVoiceEntry[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object') return [];
+      const item = entry as Partial<TtsSpeakerVoiceEntry>;
+      return [{
+        id: typeof item.id === 'string' && item.id ? item.id : createTtsDictionaryId(),
+        speakerName: typeof item.speakerName === 'string' ? item.speakerName : '',
+        styleId: typeof item.styleId === 'string' ? item.styleId : '',
+        styleLabel: typeof item.styleLabel === 'string' ? item.styleLabel : '',
+      }];
+    });
+  }
 
   const SPLITTER_SIZE_PX = 10;
   const MIN_PANE_HEIGHT_PX = 74;
@@ -250,24 +353,381 @@
   }
 
   // TTS
+  function getSelectedTtsStyleId(speakerName?: string) {
+    const speakerStyleId = getSpeakerAivisStyleId(speakerName);
+    if (speakerStyleId != null) return speakerStyleId;
+    const styleId = Number.parseInt(s.ttsVoice, 10);
+    if (Number.isInteger(styleId)) return styleId;
+    return aivisStyles[0]?.id ?? null;
+  }
+
+  function syncSystemVoices() {
+    if (!('speechSynthesis' in window)) {
+      systemVoices = [];
+      return false;
+    }
+    const all = window.speechSynthesis.getVoices();
+    const japanese = all.filter((voice) =>
+      voice.lang.startsWith('ja') || voice.name.toLowerCase().includes('japan')
+    );
+    systemVoices = japanese.length ? japanese : all;
+    if (systemVoices.length && !systemVoices.some((voice) => voice.name === s.ttsSystemVoice)) {
+      s.ttsSystemVoice = systemVoices[0].name;
+      save();
+    }
+    return systemVoices.length > 0;
+  }
+
+  async function refreshAivisVoices(showSuccess = false) {
+    ttsLoadingVoices = true;
+    ttsStatusError = false;
+    ttsStatusMessage = 'AivisSpeech の音声一覧を取得しています...';
+    try {
+      const styles = await fetchAivisStyles(s.ttsEngineUrl);
+      aivisStyles = styles;
+      if (!styles.length) {
+        ttsStatusError = true;
+        ttsStatusMessage = 'AivisSpeech に音声モデルが見つかりません。モデルを追加してから再読み込みしてください。';
+        return;
+      }
+      if (!styles.some((style) => String(style.id) === s.ttsVoice)) {
+        s.ttsVoice = String(styles[0].id);
+        save();
+      }
+      if (!ttsSpeakerDraftStyleId || !styles.some((style) => String(style.id) === ttsSpeakerDraftStyleId)) {
+        ttsSpeakerDraftStyleId = String(styles[0].id);
+      }
+      ttsStatusMessage = showSuccess ? `AivisSpeech の音声を ${styles.length} 件読み込みました。` : '';
+    } catch {
+      aivisStyles = [];
+      ttsSpeakerDraftStyleId = '';
+      ttsStatusError = true;
+      ttsStatusMessage = 'AivisSpeech に接続できません。AivisSpeech を起動した状態で再読み込みしてください。';
+    } finally {
+      ttsLoadingVoices = false;
+    }
+  }
+
+  async function refreshSystemVoices(showSuccess = false) {
+    ttsLoadingVoices = true;
+    ttsStatusError = false;
+    ttsStatusMessage = 'Windows 標準音声を確認しています...';
+    try {
+      if (!('speechSynthesis' in window)) {
+        ttsStatusError = true;
+        ttsStatusMessage = 'この環境では Windows 標準の読み上げを利用できません。';
+        return;
+      }
+      syncSystemVoices();
+      if (!systemVoices.length) {
+        ttsStatusError = true;
+        ttsStatusMessage = '利用可能な Windows 音声が見つかりません。';
+        return;
+      }
+      ttsStatusMessage = showSuccess ? `Windows 標準音声を ${systemVoices.length} 件読み込みました。` : '';
+    } finally {
+      ttsLoadingVoices = false;
+    }
+  }
+
+  function stopCurrentTts() {
+    stopAivisPlayback();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  }
+
+  function clearTtsQueue() {
+    ttsQueue = [];
+    ttsQueueRevision += 1;
+    ttsQueueRunning = false;
+    stopCurrentTts();
+  }
+
+  function getTtsPendingCount() {
+    return ttsQueue.length;
+  }
+
+  function normalizeSpeakerKey(name: string) {
+    return name.trim().toLocaleLowerCase('ja-JP');
+  }
+
+  function hasAivisStyle(styleId: string) {
+    return aivisStyles.some((style) => String(style.id) === styleId);
+  }
+
+  function getAivisStyleLabel(styleId: string, fallback = '') {
+    return aivisStyles.find((style) => String(style.id) === styleId)?.displayName
+      ?? fallback
+      ?? '';
+  }
+
+  function getActiveTtsDictionary() {
+    return s.ttsDictionary
+      .filter((entry) => entry.from.trim() && entry.to.trim())
+      .slice()
+      .sort((a, b) => b.from.trim().length - a.from.trim().length);
+  }
+
+  function getActiveTtsDictionaryCount() {
+    return getActiveTtsDictionary().length;
+  }
+
+  function applyTtsDictionary(text: string) {
+    let result = text;
+    for (const entry of getActiveTtsDictionary()) {
+      result = result.split(entry.from.trim()).join(entry.to.trim());
+    }
+    return result;
+  }
+
+  function updateTtsDictionaryEntry(id: string, key: 'from' | 'to', value: string) {
+    s.ttsDictionary = s.ttsDictionary.map((entry) =>
+      entry.id === id ? { ...entry, [key]: value } : entry
+    );
+    save();
+  }
+
+  function addTtsDictionaryEntry() {
+    const from = ttsDictionaryDraftFrom.trim();
+    const to = ttsDictionaryDraftTo.trim();
+    if (!from || !to) return;
+    s.ttsDictionary = [...s.ttsDictionary, {
+      id: createTtsDictionaryId(),
+      from,
+      to,
+    }];
+    ttsDictionaryDraftFrom = '';
+    ttsDictionaryDraftTo = '';
+    save();
+  }
+
+  function removeTtsDictionaryEntry(id: string) {
+    s.ttsDictionary = s.ttsDictionary.filter((entry) => entry.id !== id);
+    save();
+  }
+
+  function getActiveTtsSpeakerVoices() {
+    return s.ttsSpeakerVoices.filter((entry) => entry.speakerName.trim() && entry.styleId);
+  }
+
+  function getActiveTtsSpeakerVoiceCount() {
+    return getActiveTtsSpeakerVoices().length;
+  }
+
+  function updateTtsSpeakerVoiceName(id: string, value: string) {
+    s.ttsSpeakerVoices = s.ttsSpeakerVoices.map((entry) =>
+      entry.id === id ? { ...entry, speakerName: value } : entry
+    );
+    save();
+  }
+
+  function updateTtsSpeakerVoiceStyle(id: string, styleId: string) {
+    s.ttsSpeakerVoices = s.ttsSpeakerVoices.map((entry) =>
+      entry.id === id
+        ? { ...entry, styleId, styleLabel: getAivisStyleLabel(styleId, entry.styleLabel) }
+        : entry
+    );
+    save();
+  }
+
+  function addTtsSpeakerVoiceEntry() {
+    const speakerName = ttsSpeakerDraftName.trim();
+    const styleId = ttsSpeakerDraftStyleId;
+    if (!speakerName || !styleId) return;
+    s.ttsSpeakerVoices = [...s.ttsSpeakerVoices, {
+      id: createTtsDictionaryId(),
+      speakerName,
+      styleId,
+      styleLabel: getAivisStyleLabel(styleId),
+    }];
+    ttsSpeakerDraftName = '';
+    save();
+  }
+
+  function removeTtsSpeakerVoiceEntry(id: string) {
+    s.ttsSpeakerVoices = s.ttsSpeakerVoices.filter((entry) => entry.id !== id);
+    save();
+  }
+
+  function getSpeakerAivisStyleId(speakerName?: string) {
+    if (!speakerName) return null;
+    const key = normalizeSpeakerKey(speakerName);
+    if (!key) return null;
+    const match = getActiveTtsSpeakerVoices().find((entry) => normalizeSpeakerKey(entry.speakerName) === key);
+    if (!match || !hasAivisStyle(match.styleId)) return null;
+    const styleId = Number.parseInt(match.styleId, 10);
+    return Number.isInteger(styleId) ? styleId : null;
+  }
+
+  function setTtsProvider(provider: TtsProvider) {
+    s.ttsProvider = provider;
+    ttsStatusError = false;
+    ttsStatusMessage = '';
+    save();
+    clearTtsQueue();
+    if (provider === 'aivis') {
+      void refreshAivisVoices();
+    } else {
+      void refreshSystemVoices();
+    }
+  }
+
+  function setTtsPlaybackMode(mode: TtsPlaybackMode) {
+    s.ttsPlaybackMode = mode;
+    save();
+    clearTtsQueue();
+  }
+
+  function isTtsCancelError(error: unknown) {
+    return error instanceof DOMException && error.name === 'AbortError';
+  }
+
+  function speakWithSystem(text: string): Promise<void> {
+    if (!('speechSynthesis' in window)) {
+      throw new Error('この環境では Windows 標準の読み上げを利用できません。');
+    }
+    if (!systemVoices.length) syncSystemVoices();
+    if (!systemVoices.length) {
+      throw new Error('利用可能な Windows 音声が見つかりません。');
+    }
+    return new Promise((resolve, reject) => {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'ja-JP';
+      utterance.rate = s.ttsRate;
+      utterance.volume = s.ttsVolume;
+      const voice = systemVoices.find((item) => item.name === s.ttsSystemVoice);
+      if (voice) utterance.voice = voice;
+      utterance.onend = () => resolve();
+      utterance.onerror = (event) => {
+        if (event.error === 'canceled' || event.error === 'interrupted') {
+          reject(new DOMException('Speech request was cancelled.', 'AbortError'));
+          return;
+        }
+        reject(new Error('Windows 標準音声の再生に失敗しました。'));
+      };
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    });
+  }
+
+  async function speakText(text: string, speakerName?: string) {
+    const normalizedText = applyTtsDictionary(text);
+    if (s.ttsProvider === 'system') {
+      try {
+        await speakWithSystem(normalizedText);
+        ttsStatusError = false;
+        ttsStatusMessage = '';
+      } catch (error) {
+        if (isTtsCancelError(error)) {
+          ttsStatusError = false;
+          ttsStatusMessage = '';
+          return;
+        }
+        ttsStatusError = true;
+        ttsStatusMessage = error instanceof Error
+          ? error.message
+          : 'この環境では Windows 標準の読み上げを利用できません。';
+      }
+      return;
+    }
+
+    const styleId = getSelectedTtsStyleId(speakerName);
+    if (styleId == null) {
+      if (!ttsLoadingVoices) await refreshAivisVoices();
+    }
+    const nextStyleId = getSelectedTtsStyleId(speakerName);
+    if (nextStyleId == null) {
+      try {
+        await speakWithSystem(normalizedText);
+        ttsStatusError = false;
+        ttsStatusMessage = 'AivisSpeech の音声が使えないため、Windows 標準音声で読み上げています。';
+      } catch (fallbackError) {
+        ttsStatusError = true;
+        if (!ttsStatusMessage) {
+          ttsStatusMessage = fallbackError instanceof Error
+            ? `AivisSpeech を利用できず、${fallbackError.message}`
+            : '読み上げに使う音声がまだ選べていません。AivisSpeech を確認してください。';
+        }
+      }
+      return;
+    }
+    try {
+      await speakWithAivis({
+        baseUrl: s.ttsEngineUrl,
+        text: normalizedText,
+        speakerId: nextStyleId,
+        rate: s.ttsRate,
+        volume: s.ttsVolume,
+      });
+      ttsStatusError = false;
+      ttsStatusMessage = '';
+    } catch (error) {
+      if (isTtsCancelError(error) || (error instanceof Error && error.message.includes('cancelled'))) {
+        ttsStatusError = false;
+        ttsStatusMessage = '';
+        return;
+      }
+      try {
+        await speakWithSystem(normalizedText);
+        ttsStatusError = false;
+        ttsStatusMessage = 'AivisSpeech に接続できないため、Windows 標準音声で読み上げています。';
+      } catch (fallbackError) {
+        ttsStatusError = true;
+        ttsStatusMessage = fallbackError instanceof Error
+          ? `AivisSpeech に接続できず、${fallbackError.message}`
+          : 'AivisSpeech での読み上げに失敗しました。エンジンの起動状態を確認してください。';
+      }
+    }
+  }
+
+  async function runTtsQueue(revision: number) {
+    if (ttsQueueRunning) return;
+    ttsQueueRunning = true;
+    try {
+      while (ttsQueue.length > 0 && revision === ttsQueueRevision) {
+        const [next, ...rest] = ttsQueue;
+        ttsQueue = rest;
+        await speakText(next.text, next.speakerName);
+      }
+    } finally {
+      if (revision === ttsQueueRevision) {
+        ttsQueueRunning = false;
+      }
+    }
+  }
+
+  function queueSpeech(text: string, speakerName?: string) {
+    if (s.ttsPlaybackMode === 'interrupt') {
+      ttsQueue = [];
+      ttsQueueRevision += 1;
+      stopCurrentTts();
+      void speakText(text, speakerName);
+      return;
+    }
+    if (s.ttsPlaybackMode === 'latest_after_current') {
+      ttsQueue = [{ text, speakerName }];
+      const revision = ttsQueueRevision;
+      if (!ttsQueueRunning) {
+        void runTtsQueue(revision);
+      }
+      return;
+    }
+    ttsQueue = [...ttsQueue, { text, speakerName }];
+    const revision = ttsQueueRevision;
+    if (!ttsQueueRunning) {
+      void runTtsQueue(revision);
+    }
+  }
+
   function speak(msg: ChatMessage) {
     if (!s.ttsEnabled || !s.ttsChannels.includes(msg.channel)) return;
-    if (!('speechSynthesis' in window)) return;
     if (isStamp(msg.text)) return;
     const clean = stripSprites(msg.text);
     if (!clean) return;
-    const utt = new SpeechSynthesisUtterance(`${msg.sender_name}、${clean}`);
-    utt.lang = 'ja-JP'; utt.rate = s.ttsRate; utt.volume = s.ttsVolume;
-    if (s.ttsVoice) { const v = voices.find(v => v.name === s.ttsVoice); if (v) utt.voice = v; }
-    window.speechSynthesis.cancel(); window.speechSynthesis.speak(utt);
+    queueSpeech(`${msg.sender_name}、${clean}`, msg.sender_name);
   }
 
   function testTts() {
-    if (!('speechSynthesis' in window)) return;
-    const utt = new SpeechSynthesisUtterance('テスト、ワールドチャット');
-    utt.lang = 'ja-JP'; utt.rate = s.ttsRate; utt.volume = s.ttsVolume;
-    if (s.ttsVoice) { const v = voices.find(v => v.name === s.ttsVoice); if (v) utt.voice = v; }
-    window.speechSynthesis.cancel(); window.speechSynthesis.speak(utt);
+    queueSpeech('テスト、ワールドチャット');
   }
 
   function toggleTtsCh(id: number) {
@@ -482,6 +942,22 @@
       const saved = localStorage.getItem('rchat');
       if (saved) {
         const parsed = JSON.parse(saved);
+        const legacyVoice = typeof parsed.ttsVoice === 'string' ? parsed.ttsVoice : '';
+        const legacyLooksSystemVoice = !!legacyVoice && !/^-?\d+$/.test(legacyVoice);
+        const parsedProvider: TtsProvider =
+          parsed.ttsProvider === 'aivis' || parsed.ttsProvider === 'system'
+            ? parsed.ttsProvider
+            : legacyLooksSystemVoice
+              ? 'system'
+              : parsed.ttsEngineUrl || legacyVoice
+                ? 'aivis'
+                : DEFAULTS.ttsProvider;
+        const parsedPlaybackMode: TtsPlaybackMode =
+          parsed.ttsPlaybackMode === 'queue'
+            || parsed.ttsPlaybackMode === 'interrupt'
+            || parsed.ttsPlaybackMode === 'latest_after_current'
+            ? parsed.ttsPlaybackMode
+            : DEFAULTS.ttsPlaybackMode;
         const splitMode: SplitMode = parsed.splitMode === 2 || parsed.splitMode === 3 || parsed.splitMode === 1
           ? parsed.splitMode
           : parsed.splitView ? 2 : 1;
@@ -489,6 +965,16 @@
           ...DEFAULTS,
           customTheme: { ...DEFAULT_CUSTOM },
           ...parsed,
+          ttsProvider: parsedProvider,
+          ttsPlaybackMode: parsedPlaybackMode,
+          ttsDictionary: normalizeTtsDictionary(parsed.ttsDictionary),
+          ttsSpeakerVoices: normalizeTtsSpeakerVoices(parsed.ttsSpeakerVoices),
+          ttsVoice: legacyLooksSystemVoice ? '' : legacyVoice,
+          ttsSystemVoice: typeof parsed.ttsSystemVoice === 'string'
+            ? parsed.ttsSystemVoice
+            : legacyLooksSystemVoice
+              ? legacyVoice
+              : DEFAULTS.ttsSystemVoice,
           splitMode,
           displayChannelsA: normalizeDisplayChannels(parsed.displayChannelsA),
           displayChannelsB: normalizeDisplayChannels(parsed.displayChannelsB),
@@ -499,6 +985,8 @@
         };
       }
     } catch {}
+    if (!s.ttsEngineUrl?.trim()) s.ttsEngineUrl = DEFAULT_AIVIS_URL;
+    if (s.ttsVoice && !/^-?\d+$/.test(s.ttsVoice)) s.ttsVoice = '';
     applyCSS(s);
     try { await getCurrentWebviewWindow().setAlwaysOnTop(s.alwaysOnTop); } catch {}
     if (s.notifyHasCustomSound) {
@@ -507,24 +995,37 @@
       else { s.notifyHasCustomSound = false; }
     }
     if ('speechSynthesis' in window) {
-      const load = () => {
-        const all = window.speechSynthesis.getVoices();
-        voices = all.filter(v => v.lang.startsWith('ja') || v.name.toLowerCase().includes('japan'));
-        if (!voices.length) voices = all;
+      const syncVoices = () => {
+        const hasVoices = syncSystemVoices();
+        if (s.ttsProvider === 'system' && hasVoices && ttsStatusError) {
+          ttsStatusError = false;
+          ttsStatusMessage = '';
+        }
       };
-      load(); window.speechSynthesis.onvoiceschanged = load;
+      syncVoices();
+      window.speechSynthesis.onvoiceschanged = syncVoices;
+    }
+    if (s.ttsProvider === 'aivis' && (s.ttsEnabled || !!s.ttsVoice)) {
+      void refreshAivisVoices();
+    }
+    if (s.ttsProvider === 'system' && (s.ttsEnabled || !!s.ttsSystemVoice)) {
+      void refreshSystemVoices();
     }
     const unlistenChat = await listen<ChatMessage>('chat-message', ({ payload: msg }) => {
       messages = [...messages.slice(-999), msg];
       if (autoScrollA && listElA) setTimeout(() => { listElA!.scrollTop = listElA!.scrollHeight; }, 0);
       if (autoScrollB && listElB) setTimeout(() => { listElB!.scrollTop = listElB!.scrollHeight; }, 0);
       if (autoScrollC && listElC) setTimeout(() => { listElC!.scrollTop = listElC!.scrollHeight; }, 0);
-      if (!s.blacklist.includes(msg.sender_name)) { speak(msg); checkKeywords(msg); }
+      if (!s.blacklist.includes(msg.sender_name)) { void speak(msg); checkKeywords(msg); }
     });
     const unlistenStatus = await listen<CaptureStatus>('capture-status', ({ payload }) => {
       captureStatus = payload;
     });
     return () => {
+      clearTtsQueue();
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.onvoiceschanged = null;
+      }
       unlistenChat();
       unlistenStatus();
     };
@@ -534,7 +1035,7 @@
 <!-- MARKUP -->
 <div class="app" onclick={() => { blockPopup = null; }}>
   <header class="header">
-    <div class="header-title">チャット</div>
+          <div class="header-title">Resonance Chat</div>
     <div class="header-actions">
       <button
         class="pill split-toggle"
@@ -542,8 +1043,57 @@
         style:--pc={'var(--accent)'}
         onclick={cycleSplitMode}
       >分割</button>
-      <button class="gear" class:active={panelOpen}
-        onclick={() => { panelOpen = !panelOpen; }} title="設定">
+      <button
+        class="panel-icon voice-icon"
+        class:active={panelOpen && panelKind === 'tts'}
+        onclick={() => togglePanel('tts')}
+        title="読み上げ設定"
+        aria-label="読み上げ設定"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 3 9 3 15 6 15 11 19 11 5"></polygon>
+          <path d="M15.5 8.5a5 5 0 0 1 0 7"></path>
+          <path d="M18.5 6a8.5 8.5 0 0 1 0 12"></path>
+        </svg>
+      </button>
+      <button
+        class="panel-icon speaker-icon"
+        class:active={panelOpen && panelKind === 'speaker'}
+        onclick={() => togglePanel('speaker')}
+        title="話者別音声"
+        aria-label="話者別音声"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"></path>
+          <circle cx="10" cy="7" r="4"></circle>
+          <path d="M19 8l2 2-2 2"></path>
+          <path d="M15 10h6"></path>
+        </svg>
+      </button>
+      <button
+        class="panel-icon dictionary-icon"
+        class:active={panelOpen && panelKind === 'dictionary'}
+        onclick={() => togglePanel('dictionary')}
+        title="読み上げ辞書"
+        aria-label="読み上げ辞書"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+          <path d="M6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"></path>
+          <path d="M10 7h5"></path>
+          <path d="M10 11h6"></path>
+        </svg>
+      </button>
+      <button
+        class="panel-icon gear"
+        class:active={panelOpen && panelKind === 'general'}
+        onclick={() => togglePanel('general')}
+        title="設定"
+        aria-label="設定"
+      >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"/>
@@ -725,17 +1275,26 @@
 
 
   {#if panelOpen}
-    <div class="backdrop" onclick={() => { panelOpen = false; }}></div>
+    <div class="backdrop" onclick={closePanel}></div>
   {/if}
 
   <aside class="panel" class:open={panelOpen}>
     <div class="panel-head">
-      <span>設定</span>
-      <button class="close-btn" onclick={() => { panelOpen = false; }}>×</button>
+      <span>
+        {panelKind === 'general'
+          ? '設定'
+          : panelKind === 'tts'
+            ? '読み上げ設定'
+            : panelKind === 'speaker'
+              ? '話者別音声'
+              : '読み上げ辞書'}
+      </span>
+      <button class="close-btn" onclick={closePanel}>×</button>
     </div>
     <div class="panel-body">
 
       <!-- Theme -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <h4 class="sect-title">テーマ</h4>
         <!-- 4x2 grid: 7 presets + 1 custom -->
@@ -835,24 +1394,30 @@
           </div>
         {/if}
       </section>
+      {/if}
 
       <!-- Font size -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <h4 class="sect-title">フォントサイズ <em>{s.fontSize}px</em></h4>
         <input type="range" min="10" max="22" step="1"
           class="slider" bind:value={s.fontSize} oninput={save} />
         <div class="range-labels"><span>小</span><span>大</span></div>
       </section>
+      {/if}
 
       <!-- Opacity -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <h4 class="sect-title">背景の透明度 <em>{Math.round(s.bgOpacity * 100)}%</em></h4>
         <input type="range" min="0.05" max="1.0" step="0.05"
           class="slider" bind:value={s.bgOpacity} oninput={save} />
         <div class="range-labels"><span>透明</span><span>不透明</span></div>
       </section>
+      {/if}
 
       <!-- Always on top -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <label class="toggle-row">
           <span class="toggle-label">常に最前面に表示</span>
@@ -862,8 +1427,10 @@
           </button>
         </label>
       </section>
+      {/if}
 
       <!-- Keyword notify -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <label class="toggle-row">
           <span class="toggle-label">キーワード通知音</span>
@@ -904,18 +1471,113 @@
           </div>
         {/if}
       </section>
+      {/if}
 
       <!-- TTS -->
+      {#if panelKind === 'tts'}
       <section class="sect">
         <label class="toggle-row">
-          <span class="toggle-label">チャット読み上げ (TTS)</span>
+          <span class="toggle-label">チャット読み上げ</span>
           <button class="tog" class:on={s.ttsEnabled}
-            onclick={() => { s.ttsEnabled = !s.ttsEnabled; save(); }}>
+            onclick={() => {
+              s.ttsEnabled = !s.ttsEnabled;
+              save();
+              if (s.ttsEnabled) {
+                if (s.ttsProvider === 'aivis') {
+                  void refreshAivisVoices();
+                } else {
+                  void refreshSystemVoices();
+                }
+              } else {
+                clearTtsQueue();
+              }
+            }}>
             <span class="tog-knob"></span>
           </button>
         </label>
         {#if s.ttsEnabled}
           <div class="tts-sub">
+            <div class="subsect">
+              <span class="sublabel">読み上げ方式</span>
+              <div class="ch-pills">
+                <button class="pill" class:on={s.ttsProvider === 'aivis'}
+                  style:--pc={'var(--accent)'}
+                  onclick={() => setTtsProvider('aivis')}>AivisSpeech</button>
+                <button class="pill" class:on={s.ttsProvider === 'system'}
+                  style:--pc={'var(--accent)'}
+                  onclick={() => setTtsProvider('system')}>Windows 標準</button>
+              </div>
+            </div>
+            {#if s.ttsProvider === 'aivis'}
+              <div class="subsect">
+                <span class="sublabel">AivisSpeech エンジン URL</span>
+                <div class="inline-row">
+                  <input
+                    class="text-input"
+                    type="text"
+                    bind:value={s.ttsEngineUrl}
+                    placeholder={DEFAULT_AIVIS_URL}
+                    onblur={save}
+                  />
+                  <button class="mini-btn" onclick={() => void refreshAivisVoices(true)}>
+                    {ttsLoadingVoices ? '更新中...' : '再読み込み'}
+                  </button>
+                </div>
+                <p class="helper-text">
+                  AivisSpeech を起動しておけば、そのまま `http://127.0.0.1:10101` で使えます。
+                </p>
+                <p class="helper-text">
+                  AivisSpeech に接続できないときは、読み上げ時に Windows 標準音声へ自動で切り替えます。
+                </p>
+              </div>
+            {:else}
+              <div class="subsect">
+                <span class="sublabel">Windows 標準音声</span>
+                <div class="inline-row">
+                  <p class="helper-text helper-inline">
+                    Windows に入っている音声をそのまま使います。追加インストールは不要です。
+                  </p>
+                  <button class="mini-btn" onclick={() => void refreshSystemVoices(true)}>
+                    {ttsLoadingVoices ? '更新中...' : '再読み込み'}
+                  </button>
+                </div>
+              </div>
+            {/if}
+            <div class="subsect">
+              {#if ttsStatusMessage}
+                <p class="helper-text" class:helper-error={ttsStatusError}>{ttsStatusMessage}</p>
+              {/if}
+              {#if s.ttsPlaybackMode !== 'interrupt' && getTtsPendingCount() > 0}
+                <p class="helper-text">読み上げ待ち: {getTtsPendingCount()} 件</p>
+              {/if}
+            </div>
+            <div class="subsect">
+              <span class="sublabel">新着チャットの扱い</span>
+              <div class="ch-pills">
+                <button class="pill" class:on={s.ttsPlaybackMode === 'interrupt'}
+                  style:--pc={'var(--accent)'}
+                  onclick={() => setTtsPlaybackMode('interrupt')}>中断して最新</button>
+                <button class="pill" class:on={s.ttsPlaybackMode === 'latest_after_current'}
+                  style:--pc={'var(--accent)'}
+                  onclick={() => setTtsPlaybackMode('latest_after_current')}>今の1件+最新1件</button>
+                <button class="pill" class:on={s.ttsPlaybackMode === 'queue'}
+                  style:--pc={'var(--accent)'}
+                  onclick={() => setTtsPlaybackMode('queue')}>順番に全部読む</button>
+              </div>
+              {#if s.ttsPlaybackMode === 'interrupt'}
+                <p class="helper-text">
+                  新着が来たらすぐ切り替えます。常に最新を優先したいとき向けです。
+                </p>
+              {:else if s.ttsPlaybackMode === 'latest_after_current'}
+                <p class="helper-text">
+                  今読んでいる1件は最後まで読み、その間に来た新着は最新1件だけ残します。混みやすい時間帯にいちばん扱いやすい設定です。
+                </p>
+              {:else}
+                <p class="helper-text">
+                  `順番に全部読む` は見逃しにくい反面、チャットが多いと読み上げ待ちが溜まりやすくなります。
+                </p>
+              {/if}
+            </div>
             <div class="subsect">
               <span class="sublabel">読み上げるチャンネル</span>
               <div class="ch-pills">
@@ -937,12 +1599,23 @@
               <input type="range" min="0.0" max="1.0" step="0.05"
                 class="slider" bind:value={s.ttsVolume} oninput={save} />
             </div>
-            {#if voices.length > 0}
+            {#if s.ttsProvider === 'aivis' && aivisStyles.length > 0}
               <div class="subsect">
                 <span class="sublabel">音声</span>
                 <select class="sel-voice" bind:value={s.ttsVoice} onchange={save}>
-                  <option value="">デフォルト</option>
-                  {#each voices as v}<option value={v.name}>{v.name}</option>{/each}
+                  {#each aivisStyles as style}
+                    <option value={String(style.id)}>{style.displayName}</option>
+                  {/each}
+                </select>
+              </div>
+            {/if}
+            {#if s.ttsProvider === 'system' && systemVoices.length > 0}
+              <div class="subsect">
+                <span class="sublabel">音声</span>
+                <select class="sel-voice" bind:value={s.ttsSystemVoice} onchange={save}>
+                  {#each systemVoices as voice}
+                    <option value={voice.name}>{voice.name}</option>
+                  {/each}
                 </select>
               </div>
             {/if}
@@ -952,8 +1625,174 @@
           </div>
         {/if}
       </section>
+      {/if}
+
+      {#if panelKind === 'speaker'}
+      <section class="sect">
+        <h4 class="sect-title">話者別音声 <em>{getActiveTtsSpeakerVoiceCount()}人</em></h4>
+        <p class="helper-text">
+          ギルメンなど一部の人だけ、AivisSpeech の別モデルで読み上げできます。
+        </p>
+        <p class="helper-text">
+          モデルを増やしすぎると、AivisSpeech 側のメモリ使用量が増えることがあります。
+        </p>
+        <div class="tts-sub">
+          {#if s.ttsProvider !== 'aivis'}
+            <div class="subsect">
+              <p class="helper-text">
+                現在の読み上げ方式は `Windows 標準` です。話者別音声は `AivisSpeech` 利用時に有効になります。
+              </p>
+            </div>
+          {/if}
+          <div class="subsect">
+            <div class="inline-row">
+              <span class="sublabel">AivisSpeech のモデル一覧</span>
+              <button class="mini-btn" onclick={() => void refreshAivisVoices(true)}>
+                {ttsLoadingVoices ? '更新中...' : '再読み込み'}
+              </button>
+            </div>
+            {#if ttsStatusMessage && (!aivisStyles.length || ttsStatusError)}
+              <p class="helper-text" class:helper-error={ttsStatusError}>{ttsStatusMessage}</p>
+            {/if}
+          </div>
+          {#if aivisStyles.length > 0}
+            <div class="subsect">
+              <span class="sublabel">新しく追加</span>
+              <div class="dict-row dict-add-row">
+                <input
+                  class="text-input"
+                  type="text"
+                  bind:value={ttsSpeakerDraftName}
+                    placeholder="defoco"
+                />
+                <span class="dict-arrow">→</span>
+                <select class="sel-voice" bind:value={ttsSpeakerDraftStyleId}>
+                  {#each aivisStyles as style}
+                    <option value={String(style.id)}>{style.displayName}</option>
+                  {/each}
+                </select>
+                <button
+                  class="mini-btn"
+                  onclick={addTtsSpeakerVoiceEntry}
+                  disabled={!ttsSpeakerDraftName.trim() || !ttsSpeakerDraftStyleId}
+                >追加</button>
+              </div>
+            </div>
+          {:else}
+            <div class="subsect">
+              <p class="bl-empty">AivisSpeech に接続できると、ここでモデルを選べます。</p>
+            </div>
+          {/if}
+          <div class="subsect">
+            <span class="sublabel">登録済み</span>
+            {#if s.ttsSpeakerVoices.length === 0}
+              <p class="bl-empty">まだ登録がありません。必要な人だけ個別音声にできます。</p>
+            {:else}
+              <div class="dict-list">
+                {#each s.ttsSpeakerVoices as entry (entry.id)}
+                  <div class="dict-row">
+                    <input
+                      class="text-input"
+                      type="text"
+                      value={entry.speakerName}
+                      placeholder="名前"
+                      oninput={(e) => updateTtsSpeakerVoiceName(entry.id, (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <span class="dict-arrow">→</span>
+                    <select
+                      class="sel-voice"
+                      value={entry.styleId}
+                      onchange={(e) => updateTtsSpeakerVoiceStyle(entry.id, (e.currentTarget as HTMLSelectElement).value)}
+                    >
+                      {#if entry.styleId && !hasAivisStyle(entry.styleId)}
+                        <option value={entry.styleId}>{getAivisStyleLabel(entry.styleId, entry.styleLabel) || '未取得のモデル'}</option>
+                      {/if}
+                      {#each aivisStyles as style}
+                        <option value={String(style.id)}>{style.displayName}</option>
+                      {/each}
+                    </select>
+                    <button class="mini-btn danger" onclick={() => removeTtsSpeakerVoiceEntry(entry.id)}>削除</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            <p class="helper-text">
+              一致した名前の発言だけ個別音声を使います。見つからないモデルは共通音声に戻ります。
+            </p>
+          </div>
+        </div>
+      </section>
+      {/if}
+
+      {#if panelKind === 'dictionary'}
+      <section class="sect">
+        <h4 class="sect-title">読み上げ辞書 <em>{getActiveTtsDictionaryCount()}件</em></h4>
+        <p class="helper-text">
+          ここで登録した語句は、AivisSpeech や Windows 標準音声へ渡す前に置換します。
+        </p>
+        <div class="tts-sub">
+          <div class="subsect">
+            <span class="sublabel">新しく追加</span>
+            <div class="dict-row dict-add-row">
+              <input
+                class="text-input"
+                type="text"
+                bind:value={ttsDictionaryDraftFrom}
+                placeholder="DPS"
+              />
+              <span class="dict-arrow">→</span>
+              <input
+                class="text-input"
+                type="text"
+                bind:value={ttsDictionaryDraftTo}
+                placeholder="ディーピーエス"
+              />
+              <button
+                class="mini-btn"
+                onclick={addTtsDictionaryEntry}
+                disabled={!ttsDictionaryDraftFrom.trim() || !ttsDictionaryDraftTo.trim()}
+              >追加</button>
+            </div>
+          </div>
+
+          <div class="subsect">
+            <span class="sublabel">登録済み</span>
+            {#if s.ttsDictionary.length === 0}
+              <p class="bl-empty">まだ登録がありません。読みが崩れやすい単語をここで直せます。</p>
+            {:else}
+              <div class="dict-list">
+                {#each s.ttsDictionary as entry (entry.id)}
+                  <div class="dict-row">
+                    <input
+                      class="text-input"
+                      type="text"
+                      value={entry.from}
+                      placeholder="語句"
+                      oninput={(e) => updateTtsDictionaryEntry(entry.id, 'from', (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <span class="dict-arrow">→</span>
+                    <input
+                      class="text-input"
+                      type="text"
+                      value={entry.to}
+                      placeholder="読み"
+                      oninput={(e) => updateTtsDictionaryEntry(entry.id, 'to', (e.currentTarget as HTMLInputElement).value)}
+                    />
+                    <button class="mini-btn danger" onclick={() => removeTtsDictionaryEntry(entry.id)}>削除</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            <p class="helper-text">
+              長い単語を優先して置換します。空欄の行は読み上げ時に無視されます。
+            </p>
+          </div>
+        </div>
+      </section>
+      {/if}
 
       <!-- Blacklist -->
+      {#if panelKind === 'general'}
       <section class="sect">
         <h4 class="sect-title">ブラックリスト <em>{s.blacklist.length}</em></h4>
         {#if s.blacklist.length === 0}
@@ -969,6 +1808,7 @@
           </div>
         {/if}
       </section>
+      {/if}
 
     </div>
   </aside>
@@ -999,14 +1839,18 @@
   .tab:hover  { color: var(--text); background: rgb(var(--bg) / 0.5); }
   .tab.active { color: var(--tc, var(--accent)); border-bottom-color: var(--tc, var(--accent)); }
 
-  .gear {
+  .panel-icon {
     width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
     border: none; background: transparent; color: var(--text-dim);
     cursor: pointer; border-radius: 6px; flex-shrink: 0;
-    transition: color 0.15s, background 0.15s, transform 0.3s;
+    transition: color 0.15s, background 0.15s, transform 0.2s;
   }
-  .gear:hover  { color: var(--accent); background: rgb(var(--bg) / 0.5); }
-  .gear.active { color: var(--accent); transform: rotate(60deg); }
+  .panel-icon:hover  { color: var(--accent); background: rgb(var(--bg) / 0.5); }
+  .panel-icon.active { color: var(--accent); background: rgb(var(--bg) / 0.55); }
+  .gear.active { transform: rotate(60deg); }
+  .voice-icon.active { transform: translateY(-1px); }
+  .speaker-icon.active { transform: translateY(-1px); }
+  .dictionary-icon.active { transform: translateY(-1px); }
 
   /* Messages */
   .messages {
@@ -1249,18 +2093,70 @@
     transition: background 0.15s, border-color 0.15s; flex-shrink: 0;
   }
   .mini-btn:hover { border-color: var(--accent); }
+  .mini-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    border-color: var(--border);
+  }
+  .mini-btn:disabled:hover {
+    border-color: var(--border);
+    background: var(--input-bg);
+  }
   .mini-btn.danger { color: #f87171; border-color: rgba(248,113,113,0.4); }
   .mini-btn.danger:hover { background: rgba(248,113,113,0.12); }
   .file-label { cursor: pointer; }
   .hidden-file { display: none; }
 
   /* Voice / buttons */
+  .inline-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .text-input,
   .sel-voice {
     width: 100%; padding: 6px 8px;
-    background: var(--input-bg); border: 1px solid var(--border);
+    background: rgb(var(--surface) / 0.96); border: 1px solid var(--border);
     color: var(--text); border-radius: 6px; font: inherit; font-size: 0.85em; outline: none; cursor: pointer;
   }
+  .sel-voice option {
+    background: rgb(var(--surface));
+    color: var(--text);
+  }
+  .text-input {
+    cursor: text;
+  }
+  .text-input:focus,
   .sel-voice:focus { border-color: var(--accent); }
+  .helper-text {
+    margin: 2px 0 0;
+    font-size: 0.76em;
+    color: var(--text-dim);
+    line-height: 1.45;
+  }
+  .helper-error {
+    color: #fda4af;
+  }
+  .helper-inline {
+    flex: 1;
+    margin-top: 0;
+  }
+  .dict-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .dict-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+    gap: 6px;
+    align-items: center;
+  }
+  .dict-arrow {
+    color: var(--text-dim);
+    font-size: 0.8em;
+    line-height: 1;
+  }
   .btn-row { display: flex; gap: 8px; }
   .test-btn {
     background: var(--input-bg); border: 1px solid var(--border); color: var(--accent);
@@ -1391,6 +2287,15 @@
   :global(body.split-resizing) {
     user-select: none;
     cursor: row-resize;
+  }
+
+  @media (max-width: 560px) {
+    .dict-row {
+      grid-template-columns: 1fr;
+    }
+    .dict-arrow {
+      display: none;
+    }
   }
 </style>
 

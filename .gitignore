@@ -30,3 +30,7 @@ npm-debug.log*
 
 # Generated release verification output
 docs/security-check.generated.md
+
+.claude/settings.local.json
+
+.claude/settings.local.json
