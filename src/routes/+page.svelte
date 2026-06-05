@@ -6,8 +6,9 @@
     stopAivisPlayback,
     type AivisStyle,
   } from '$lib/aivis';
-  import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+  import { invoke } from '@tauri-apps/api/core';
+  import { emit, listen } from '@tauri-apps/api/event';
+  import { getCurrentWebviewWindow, WebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { onMount } from 'svelte';
 
   interface ChatMessage {
@@ -141,6 +142,7 @@
   let ttsSpeakerDraftStyleId = $state('');
   let soundFileName = $state('');
   let blockPopup = $state<{ name: string; x: number; y: number } | null>(null);
+  let dpsWindowOpen = $state(false);
 
   let notifyAudio: HTMLAudioElement | null = null;
   let audioCtx: AudioContext | null = null;
@@ -255,7 +257,18 @@
     }
   }
 
-  function save() { localStorage.setItem('rchat', JSON.stringify(s)); applyCSS(s); }
+  function save() {
+    localStorage.setItem('rchat', JSON.stringify(s));
+    applyCSS(s);
+    // Propagate appearance to the DPS window (separate webview; the storage
+    // event isn't reliable across Tauri windows, so push via a Tauri event).
+    void emit('rchat-theme', {
+      theme: s.theme,
+      fontSize: s.fontSize,
+      bgOpacity: s.bgOpacity,
+      customTheme: s.customTheme,
+    });
+  }
 
   function selectTheme(id: string) { s.theme = id; save(); }
 
@@ -904,7 +917,71 @@
   async function setAlwaysOnTop(val: boolean) {
     s.alwaysOnTop = val;
     try { await getCurrentWebviewWindow().setAlwaysOnTop(val); } catch {}
+    try {
+      const dpsWindow = await WebviewWindow.getByLabel('dps');
+      await dpsWindow?.setAlwaysOnTop(val);
+    } catch {}
     save();
+  }
+
+  async function syncDpsWindowState() {
+    try {
+      dpsWindowOpen = (await WebviewWindow.getByLabel('dps')) !== null;
+    } catch {
+      dpsWindowOpen = false;
+    }
+  }
+
+  async function openDpsWindow() {
+    const existing = await WebviewWindow.getByLabel('dps');
+    if (existing) {
+      dpsWindowOpen = true;
+      await existing.show().catch(() => {});
+      await existing.setFocus().catch(() => {});
+      return;
+    }
+
+    const dpsWindow = new WebviewWindow('dps', {
+      url: '/dps',
+      title: 'Resonance DPS',
+      width: 360,
+      height: 520,
+      minWidth: 280,
+      minHeight: 240,
+      transparent: true,
+      decorations: false,
+      resizable: true,
+      alwaysOnTop: s.alwaysOnTop,
+      parent: 'main',
+      shadow: true,
+      focus: true,
+    });
+
+    dpsWindow.once('tauri://created', () => {
+      dpsWindowOpen = true;
+      void dpsWindow.setFocus();
+    });
+    dpsWindow.once('tauri://error', () => {
+      dpsWindowOpen = false;
+    });
+  }
+
+  async function closeDpsWindow() {
+    const existing = await WebviewWindow.getByLabel('dps');
+    if (existing) {
+      await invoke('close_dps_window').catch(async () => {
+        await existing.close().catch(() => {});
+      });
+    }
+    dpsWindowOpen = false;
+  }
+
+  async function toggleDpsWindow() {
+    if (await WebviewWindow.getByLabel('dps')) {
+      await closeDpsWindow();
+    } else {
+      await openDpsWindow();
+    }
   }
 
   function getListEl(which: PaneId) {
@@ -1021,6 +1098,13 @@
     const unlistenStatus = await listen<CaptureStatus>('capture-status', ({ payload }) => {
       captureStatus = payload;
     });
+    const unlistenDpsOpened = await listen('dps-window-opened', () => {
+      dpsWindowOpen = true;
+    });
+    const unlistenDpsClosed = await listen('dps-window-closed', () => {
+      dpsWindowOpen = false;
+    });
+    await syncDpsWindowState();
     return () => {
       clearTtsQueue();
       if ('speechSynthesis' in window) {
@@ -1028,6 +1112,8 @@
       }
       unlistenChat();
       unlistenStatus();
+      unlistenDpsOpened();
+      unlistenDpsClosed();
     };
   });
 </script>
@@ -1037,6 +1123,12 @@
   <header class="header">
           <div class="header-title">Resonance Chat</div>
     <div class="header-actions">
+      <button
+        class="pill dps-toggle"
+        class:on={dpsWindowOpen}
+        style:--pc={'var(--accent)'}
+        onclick={() => { void toggleDpsWindow(); }}
+      >DPS</button>
       <button
         class="pill split-toggle"
         class:on={s.splitMode > 1}

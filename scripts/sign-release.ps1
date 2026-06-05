@@ -10,7 +10,7 @@ verifies the signature with signtool and Get-AuthenticodeSignature.
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\scripts\sign-release.ps1 `
   -TimestampUrl https://timestamp.digicert.com `
-  -CertificatePath C:\secure\codesign.pfx
+  -CertificatePath <path-to-codesign.pfx>
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\scripts\sign-release.ps1 `
@@ -59,10 +59,12 @@ function Resolve-SignTool {
         return $cmd.Source
     }
 
+    $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+    $programFiles = [Environment]::GetFolderPath("ProgramFiles")
     $roots = @(
-        "C:\Program Files (x86)\Windows Kits\10\bin",
-        "C:\Program Files\Windows Kits\10\bin"
-    )
+        (Join-Path $programFilesX86 "Windows Kits\10\bin"),
+        (Join-Path $programFiles "Windows Kits\10\bin")
+    ) | Where-Object { $_ }
 
     foreach ($root in $roots) {
         if (-not (Test-Path $root)) {

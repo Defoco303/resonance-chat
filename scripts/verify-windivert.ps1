@@ -9,7 +9,7 @@ report that can be attached to a release checklist.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\scripts\verify-windivert.ps1 `
-  -OfficialDir C:\Downloads\WinDivert-2.2.2-A `
+  -OfficialDir <path-to-official-windivert> `
   -ReportPath docs\security-check.generated.md
 #>
 [CmdletBinding()]

@@ -5,9 +5,15 @@
     "permissions": [
         "core:default",
         "core:event:default",
+        "core:webview:allow-create-webview-window",
+        "core:webview:allow-set-webview-background-color",
         "core:window:allow-set-always-on-top",
         "core:window:allow-set-focus",
         "core:window:allow-start-dragging",
-        "core:window:allow-is-always-on-top"
+        "core:window:allow-is-always-on-top",
+        "core:window:allow-get-all-windows",
+        "core:window:allow-close",
+        "core:window:allow-show",
+        "core:window:allow-is-visible"
     ]
 }

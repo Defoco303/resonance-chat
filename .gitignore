@@ -1,5 +1,6 @@
 # Rust / Tauri build output
 src-tauri/target/
+src-tauri/target-dps-window/
 src-tauri/windivert-prebuilt/
 
 # Node.js
@@ -33,4 +34,5 @@ docs/security-check.generated.md
 
 .claude/settings.local.json
 
-.claude/settings.local.json
+# Runtime assets are served from static/class_icon; keep accidental duplicates out.
+/class_icon/
