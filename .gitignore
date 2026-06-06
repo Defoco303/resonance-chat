@@ -1,5 +1,6 @@
 # Rust / Tauri build output
 src-tauri/target/
+src-tauri/target-*/
 src-tauri/target-dps-window/
 src-tauri/windivert-prebuilt/
 

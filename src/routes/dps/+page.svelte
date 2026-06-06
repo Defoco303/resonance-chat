@@ -2,11 +2,13 @@
   import {
     classColor,
     classIconUrl,
+    classSpecLabel,
     DEFAULT_DPS_SETTINGS,
     DPS_SETTINGS_KEY,
     fmtCompact,
     fmtSeconds,
     isRealClass,
+    isRealClassSpec,
     isRealName,
     loadBossList,
     loadDpsSettings,
@@ -183,6 +185,17 @@
     return value.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
   }
 
+  function fmtPercent(value: number) {
+    if (!Number.isFinite(value) || value <= 0) return '0%';
+    return `${Math.round(value)}%`;
+  }
+
+  function podiumMetricLabel(entry: PodiumEntry, group: PodiumGroup) {
+    if (entry.placeholder) return '—';
+    const value = group.metric === 'tank' ? fmtTankScore(tankScoreOf(entry)) : fmtCompact(entry.dps);
+    return `${value} ${group.rateLabel}(${fmtPercent(entry.damagePct)})`;
+  }
+
   function resolveMetric(payload: DpsMeterPayload, metric: DpsMetricType, sc: DpsScope): DpsMetricPayload {
     if (metric === 'dps' && sc === 'boss') {
       return payload.metrics?.dpsBossOnly ?? emptyMetric();
@@ -216,6 +229,7 @@
       let updated = false;
       if (isRealName(row.name) && cur.name !== row.name) { cur.name = row.name; updated = true; }
       if (isRealClass(row.className) && cur.className !== row.className) { cur.className = row.className; updated = true; }
+      if (isRealClassSpec(row.classSpecName) && cur.classSpecName !== row.classSpecName) { cur.classSpecName = row.classSpecName; updated = true; }
       if (updated) { next[key] = cur; changed = true; }
     }
     if (changed) {
@@ -230,6 +244,14 @@
 
   function effClass(uid: number, className: string) {
     return isRealClass(className) ? className : (idCache[String(uid)]?.className ?? className);
+  }
+
+  function effClassSpec(uid: number, classSpecName: string) {
+    return isRealClassSpec(classSpecName) ? classSpecName : (idCache[String(uid)]?.classSpecName ?? classSpecName);
+  }
+
+  function rowClassSpecLabel(row: DpsPlayerRow) {
+    return classSpecLabel(effClassSpec(row.uid, row.classSpecName));
   }
 
   function setActiveMetric(metric: ActiveTab) {
@@ -504,6 +526,12 @@
     return '\u{1F949}';
   }
 
+  function podiumRankLabel(rank: number) {
+    if (rank === 1) return '1st';
+    if (rank === 2) return '2nd';
+    return '3rd';
+  }
+
   async function closeWindow() {
     await emit('dps-window-closed');
     await invoke('close_dps_window');
@@ -675,11 +703,16 @@
         style:--bar={`${barMax > 0 ? Math.max(3, (activeMetric === 'tank' ? tankScoreOf(row) : row.totalDamage) / barMax * 100) : 0}%`}
         style:--class-color={rowColor(effClass(row.uid, row.className))}
       >
-        <div class="dps-class-icon" aria-hidden="true">
-          {#if classIconUrl(effClass(row.uid, row.className))}
-            <img src={classIconUrl(effClass(row.uid, row.className))} alt="" />
-          {:else}
-            <span>?</span>
+        <div class="dps-class">
+          <div class="dps-class-icon" aria-hidden="true">
+            {#if classIconUrl(effClass(row.uid, row.className))}
+              <img src={classIconUrl(effClass(row.uid, row.className))} alt="" />
+            {:else}
+              <span>?</span>
+            {/if}
+          </div>
+          {#if rowClassSpecLabel(row)}
+            <span class="dps-spec-name">{rowClassSpecLabel(row)}</span>
           {/if}
         </div>
         <div class="dps-player">
@@ -731,10 +764,15 @@
                     <span>?</span>
                   {/if}
                 </div>
+                <div class="podium-rank">
+                  <span class="podium-rank-label">{podiumRankLabel(entry.rank)}</span>
+                  {#if !entry.placeholder && rowClassSpecLabel(entry)}
+                    <span class="podium-spec">{rowClassSpecLabel(entry)}</span>
+                  {/if}
+                </div>
                 <div class="podium-info">
-                  <span>{entry.rank}位</span>
                   <strong>{entry.name}</strong>
-                  <em>{entry.placeholder ? '—' : group.metric === 'tank' ? `${fmtTankScore(tankScoreOf(entry))} TANK` : `${fmtCompact(entry.dps)} ${group.rateLabel}`}</em>
+                  <em>{podiumMetricLabel(entry, group)}</em>
                 </div>
               </div>
             {/each}
@@ -950,7 +988,7 @@
   .dps-row {
     position: relative;
     display: grid;
-    grid-template-columns: 24px minmax(0, 1fr) minmax(88px, auto);
+    grid-template-columns: minmax(64px, 72px) minmax(0, 1fr) minmax(88px, auto);
     align-items: center;
     gap: 6px;
     min-height: 27px;
@@ -1024,12 +1062,20 @@
     }
   }
   .dps-class-icon,
+  .dps-class,
   .dps-player,
   .dps-values {
     position: relative;
     z-index: 1;
   }
+  .dps-class {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
   .dps-class-icon {
+    flex: 0 0 auto;
     width: 22px;
     height: 22px;
     display: flex;
@@ -1052,6 +1098,17 @@
     color: var(--text-dim);
     font-size: 0.72em;
     font-weight: 800;
+  }
+  .dps-spec-name {
+    min-width: 0;
+    color: color-mix(in srgb, var(--class-color) 72%, white);
+    font-size: 0.62em;
+    font-weight: 900;
+    line-height: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-shadow: 0 0 8px color-mix(in srgb, var(--class-color) 28%, transparent);
+    white-space: nowrap;
   }
   .dps-player {
     min-width: 0;
@@ -1152,11 +1209,11 @@
     position: relative;
     min-width: 0;
     display: grid;
-    grid-template-columns: 26px minmax(0, 1fr);
+    grid-template-columns: 28px 34px minmax(0, 1fr);
     align-items: center;
-    gap: 6px;
-    min-height: 32px;
-    padding: 4px 7px 4px 4px;
+    gap: 5px;
+    min-height: 44px;
+    padding: 5px 10px 5px 5px;
     border: 1px solid color-mix(in srgb, var(--class-color) 74%, white);
     border-radius: 7px;
     background:
@@ -1187,8 +1244,6 @@
     pointer-events: none;
   }
   .podium-card.rank-1 {
-    min-height: 38px;
-    grid-template-columns: 32px minmax(0, 1fr);
     transform-origin: center right;
     border-color: color-mix(in srgb, var(--class-color) 86%, white);
   }
@@ -1210,17 +1265,17 @@
   }
   .podium-medal {
     position: absolute;
-    right: 5px;
-    top: 2px;
+    right: 7px;
+    top: 4px;
     z-index: 4;
-    font-size: 1.08em;
+    font-size: 1.18em;
     filter: drop-shadow(0 2px 5px rgb(0 0 0 / 0.45));
   }
   .podium-icon {
     position: relative;
     z-index: 3;
-    width: 24px;
-    height: 24px;
+    width: 28px;
+    height: 28px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1231,14 +1286,10 @@
       0 4px 13px rgb(0 0 0 / 0.32);
     overflow: hidden;
   }
-  .rank-1 .podium-icon {
-    width: 30px;
-    height: 30px;
-  }
   .podium-icon img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
+    width: calc(100% - 5px);
+    height: calc(100% - 5px);
+    object-fit: contain;
     display: block;
   }
   .podium-icon span {
@@ -1246,38 +1297,66 @@
     font-size: 0.76em;
     font-weight: 900;
   }
-  .podium-info {
+  .podium-rank {
     position: relative;
     z-index: 3;
     min-width: 0;
     display: grid;
-    gap: 1px;
+    align-content: center;
+    gap: 2px;
+    line-height: 1;
   }
-  .podium-info span {
-    color: color-mix(in srgb, var(--class-color) 76%, white);
-    font-size: 0.62em;
-    font-weight: 900;
+  .podium-rank-label {
+    color: color-mix(in srgb, var(--class-color) 74%, white);
+    font-size: 0.8em;
+    font-weight: 950;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .podium-spec {
+    min-width: 0;
+    color: color-mix(in srgb, var(--class-color) 64%, white);
+    font-size: 0.78em;
+    font-weight: 950;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .podium-info {
+    position: relative;
+    z-index: 3;
+    min-width: 0;
+    align-self: stretch;
   }
   .podium-info strong {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    translate: 0 -50%;
+    max-width: calc(100% - 6px);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--text);
-    font-size: 0.86em;
+    font-size: 1.04em;
     font-weight: 900;
   }
   .rank-1 .podium-info strong {
-    font-size: 1em;
+    font-size: 2.01em;
   }
   .podium-info em {
+    position: absolute;
+    right: 0;
+    bottom: 1px;
     min-width: 0;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--text-dim);
+    color: color-mix(in srgb, var(--class-color) 48%, white);
     font-style: normal;
-    font-size: 0.65em;
+    font-size: 0.78em;
     font-weight: 800;
     font-variant-numeric: tabular-nums;
   }
@@ -1665,6 +1744,3 @@
     background: color-mix(in srgb, #f59e0b 14%, transparent);
   }
 </style>
-
-
-

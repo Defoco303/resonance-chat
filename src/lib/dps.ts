@@ -63,6 +63,7 @@ export const DPS_ID_CACHE_KEY = 'rchat-dps-id-cache';
 export interface DpsIdentity {
   name?: string;
   className?: string;
+  classSpecName?: string;
 }
 
 export function loadIdCache(): Record<string, DpsIdentity> {
@@ -90,6 +91,10 @@ export function isRealName(name: string | undefined): boolean {
 
 export function isRealClass(className: string | undefined): boolean {
   return !!className && className !== 'Unknown Class' && className !== 'Unimplemented Class';
+}
+
+export function isRealClassSpec(classSpecName: string | undefined): boolean {
+  return !!classSpecName && !!classSpecLabel(classSpecName);
 }
 
 export interface DpsClassColor {
@@ -162,6 +167,11 @@ export function classColor(settings: DpsSettings, className: string) {
 export function classIconUrl(className: string) {
   const fileName = CLASS_ICON_FILES[className];
   return fileName ? encodeURI(`/class_icon/${fileName}`) : '';
+}
+
+export function classSpecLabel(classSpecName: string | undefined) {
+  if (!classSpecName) return '';
+  return CLASS_SPEC_LABELS[classSpecName.trim()] ?? '';
 }
 
 export function fmtCompact(value: number) {
@@ -258,3 +268,36 @@ const CLASS_ICON_FILES: Record<string, string> = {
   'Shield Knight': 'シールドファイター.webp',
   'Beat Performer': 'ビートパフォーマー.webp',
 }
+
+const CLASS_SPEC_LABELS: Record<string, string> = {
+  Iaido: '雷刃',
+  'Iaido Slash': '雷刃',
+  'Iaido Style': '雷刃',
+  Moonstrike: '月影',
+  Moonblade: '月影',
+  Vanguard: '烈風',
+  'Overdrive Style': '烈風',
+  Aerial: '乱風',
+  Skyward: '乱風',
+  'Skyward Style': '乱風',
+  Icicle: '氷牙',
+  'Frost Lance Style': '氷牙',
+  Frostbeam: '霜天',
+  'Ray Style': '霜天',
+  Wildpack: '狼弓',
+  'Beast Master': '狼弓',
+  Falconry: '鷹弓',
+  Earthfort: '剛身',
+  Stonewall: '剛身',
+  Block: '剛守',
+  Recovery: '光砕',
+  'Bulwark Style': '光砕',
+  Shield: '光盾',
+  'Radiant Guard Style': '光盾',
+  Smite: '威咲',
+  'Thorn Lash': '威咲',
+  Lifebind: '森癒',
+  'Healing Style': '森癒',
+  Dissonance: '狂音',
+  Concerto: '響奏',
+};
