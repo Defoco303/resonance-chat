@@ -69,6 +69,8 @@ pub struct CharSerialize {
     pub scene_data: ::core::option::Option<SceneData>,
     #[prost(message, optional, tag = "7")]
     pub item_package: ::core::option::Option<ItemPackage>,
+    #[prost(message, optional, tag = "55")]
+    pub slots: ::core::option::Option<Slot>,
     #[prost(message, optional, tag = "57")]
     pub r#mod: ::core::option::Option<Mod>,
     #[prost(message, optional, tag = "61")]
@@ -141,6 +143,18 @@ pub struct SceneData {
     pub line_id: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Slot {
+    #[prost(map = "int32, message", tag = "1")]
+    pub slots: ::std::collections::HashMap<i32, SlotInfo>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SlotInfo {
+    #[prost(int32, tag = "1")]
+    pub id: i32,
+    #[prost(int32, tag = "2")]
+    pub skill_id: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SkillEffect {
     #[prost(message, repeated, tag = "2")]
     pub damages: ::prost::alloc::vec::Vec<SyncDamageInfo>,
@@ -162,14 +176,20 @@ pub struct SyncSceneAttrs {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SyncDamageInfo {
+    #[prost(int32, tag = "1")]
+    pub damage_source: i32,
     #[prost(bool, tag = "2")]
     pub is_miss: bool,
+    #[prost(bool, tag = "3")]
+    pub is_crit: bool,
     #[prost(enumeration = "EDamageType", tag = "4")]
     pub r#type: i32,
     #[prost(int32, tag = "5")]
     pub type_flag: i32,
     #[prost(int64, tag = "6")]
     pub value: i64,
+    #[prost(int64, tag = "7")]
+    pub actual_value: i64,
     #[prost(int64, tag = "8")]
     pub lucky_value: i64,
     #[prost(int64, tag = "9")]
@@ -180,8 +200,12 @@ pub struct SyncDamageInfo {
     pub attacker_uuid: i64,
     #[prost(int32, tag = "12")]
     pub owner_id: i32,
+    #[prost(int32, tag = "15")]
+    pub hit_event_id: i32,
     #[prost(bool, tag = "17")]
     pub is_dead: bool,
+    #[prost(int32, tag = "18")]
+    pub property: i32,
     #[prost(int64, tag = "21")]
     pub top_summoner_id: i64,
 }

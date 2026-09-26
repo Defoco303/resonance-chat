@@ -1,4 +1,6 @@
-﻿export interface DpsPlayerRow {
+import { imagineName } from '$lib/imagines';
+
+export interface DpsPlayerRow {
   uid: number;
   name: string;
   className: string;
@@ -6,6 +8,8 @@
   abilityScore: number;
   totalDamage: number;
   dps: number;
+  tdps?: number;
+  activeTimeMs?: number;
   damagePct: number;
   critRate: number;
   hits: number;
@@ -52,18 +56,11 @@ export interface DpsMetricsPayload {
   heal: DpsMetricPayload;
 }
 
-export interface DpsBossEntry {
-  id: number;
-  name: string;
-}
-
-export const DPS_BOSS_LIST_KEY = 'rchat-dps-boss-list';
 export const DPS_ID_CACHE_KEY = 'rchat-dps-id-cache';
 
+// 名前だけを保存する（職業・型は切り替えられるので保存しない）
 export interface DpsIdentity {
   name?: string;
-  className?: string;
-  classSpecName?: string;
 }
 
 export function loadIdCache(): Record<string, DpsIdentity> {
@@ -85,16 +82,102 @@ export function saveIdCache(cache: Record<string, DpsIdentity>) {
   } catch {}
 }
 
+export type DpsEncounterEndReason = 'bossDefeated' | 'idle' | 'manual' | 'sceneChange';
+
+export interface DpsEncounterEndPayload {
+  reason: DpsEncounterEndReason;
+  endedAtMs: number;
+  result: DpsMeterPayload;
+  details: DpsPlayerDetail[];
+  detailsBossOnly: boolean;
+}
+
+// プレイヤー詳細・比較用のダメージ内訳
+export interface DpsSkillDetail {
+  skillId: number;
+  totalDamage: number;
+  hits: number;
+  critHits: number;
+  critDamage: number;
+  luckyHits: number;
+  luckyDamage: number;
+}
+
+export interface DpsPlayerDetail {
+  uid: number;
+  name: string;
+  className: string;
+  classSpecName: string;
+  abilityScore: number;
+  elapsedMs: number;
+  activeTimeMs: number;
+  totalDamage: number;
+  hits: number;
+  critHits: number;
+  critDamage: number;
+  luckyHits: number;
+  luckyDamage: number;
+  skills: DpsSkillDetail[];
+  // バトルイマジン（自分は装備中の2つ＋使ったもの、他人は使ったものだけ）。古い履歴には無い
+  imagines?: DpsImagineDetail[];
+}
+
+export interface DpsImagineDetail {
+  skillId: number;
+  equipped: boolean;
+  totalDamage: number;
+  hits: number;
+}
+
+// リザルトカードと履歴に使う1戦闘分の記録
+export interface DpsEncounterRecord {
+  id: string;
+  reason: DpsEncounterEndReason;
+  endedAtMs: number;
+  bossName: string;
+  elapsedMs: number;
+  totalDps: number;
+  totalDamage: number;
+  // true ならボス本体へのダメージだけで集計した記録（古い記録には無い）
+  bossOnly?: boolean;
+  localPlayerUid: number;
+  players: DpsPlayerRow[];
+  topHeal?: DpsPlayerRow;
+  topTank?: DpsPlayerRow;
+  // 戦闘終了時点の全員の内訳（古い記録には無い）
+  details?: DpsPlayerDetail[];
+}
+
+export const DPS_HISTORY_KEY = 'rchat-dps-history';
+export const DPS_HISTORY_LIMIT = 30;
+
+export const ENCOUNTER_END_LABELS: Record<DpsEncounterEndReason, string> = {
+  bossDefeated: 'ボス撃破',
+  idle: '30秒戦闘なし',
+  manual: '手動リセット',
+  sceneChange: '移動',
+};
+
+export function loadHistory(): DpsEncounterRecord[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const saved = localStorage.getItem(DPS_HISTORY_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? (parsed as DpsEncounterRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveHistory(history: DpsEncounterRecord[]) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(DPS_HISTORY_KEY, JSON.stringify(history.slice(0, DPS_HISTORY_LIMIT)));
+  } catch {}
+}
+
 export function isRealName(name: string | undefined): boolean {
   return !!name && name !== 'Unknown' && !name.startsWith('Player ') && !name.startsWith('Monster ');
-}
-
-export function isRealClass(className: string | undefined): boolean {
-  return !!className && className !== 'Unknown Class' && className !== 'Unimplemented Class';
-}
-
-export function isRealClassSpec(classSpecName: string | undefined): boolean {
-  return !!classSpecName && !!classSpecLabel(classSpecName);
 }
 
 export interface DpsClassColor {
@@ -120,6 +203,7 @@ export const DEFAULT_DPS_CLASS_COLORS: DpsClassColor[] = [
   { className: 'Marksman', label: 'ディバインアーチャー', color: '#fb7185' },
   { className: 'Shield Knight', label: 'シールドファイター', color: '#38bdf8' },
   { className: 'Beat Performer', label: 'ビートパフォーマー', color: '#c084fc' },
+  { className: 'Twin Striker', label: 'ツインストライカー', color: '#f97316' },
   { className: 'Unknown Class', label: '不明', color: '#94a3b8' },
   { className: 'Unimplemented Class', label: 'その他', color: '#94a3b8' },
 ]
@@ -212,37 +296,6 @@ function cloneDpsSettings(settings: DpsSettings): DpsSettings {
   };
 }
 
-export function loadBossList(): DpsBossEntry[] {
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const saved = localStorage.getItem(DPS_BOSS_LIST_KEY);
-    if (!saved) return [];
-    const parsed = JSON.parse(saved);
-    if (!Array.isArray(parsed)) return [];
-    return normalizeBossList(parsed);
-  } catch {
-    return [];
-  }
-}
-
-export function saveBossList(list: DpsBossEntry[]) {
-  if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(DPS_BOSS_LIST_KEY, JSON.stringify(normalizeBossList(list)));
-}
-
-export function normalizeBossList(list: unknown[]): DpsBossEntry[] {
-  const byId = new Map<number, string>();
-  for (const raw of list) {
-    if (!raw || typeof raw !== 'object') continue;
-    const entry = raw as Record<string, unknown>;
-    const id = Number(entry.id);
-    if (!Number.isInteger(id) || id < 0) continue;
-    const name = typeof entry.name === 'string' && entry.name.trim() ? entry.name : `Boss ${id}`;
-    byId.set(id, name);
-  }
-  return Array.from(byId, ([id, name]) => ({ id, name })).sort((a, b) => a.id - b.id);
-}
-
 function trimTrailingZero(value: string) {
   return value.replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
 }
@@ -267,9 +320,12 @@ const CLASS_ICON_FILES: Record<string, string> = {
   Marksman: 'ディバインアーチャー.webp',
   'Shield Knight': 'シールドファイター.webp',
   'Beat Performer': 'ビートパフォーマー.webp',
+  'Twin Striker': 'ツインストライカー.webp',
 }
 
 const CLASS_SPEC_LABELS: Record<string, string> = {
+  'Twin Flame': '双炎',
+  'Flame Dance': '炎舞',
   Iaido: '雷刃',
   'Iaido Slash': '雷刃',
   'Iaido Style': '雷刃',
@@ -301,3 +357,101 @@ const CLASS_SPEC_LABELS: Record<string, string> = {
   Dissonance: '狂音',
   Concerto: '響奏',
 };
+
+// スキル名の表（参考ツール StarResonanceDpsAnalysis の skills.ja-JP.json）。
+// 大きいので詳細画面を開いたときに読み込む
+export type SkillNameTable = Record<string, string>;
+let skillNameTable: Promise<SkillNameTable> | null = null;
+
+export function loadSkillNames(): Promise<SkillNameTable> {
+  skillNameTable ??= import('$lib/data/skill-names.ja.json')
+    .then((module) => module.default as SkillNameTable)
+    .catch(() => {
+      skillNameTable = null;
+      return {};
+    });
+  return skillNameTable;
+}
+
+// ツインストライカーのスキル名。ゲーム画面とログで確かめたもの（表では中国語のままのため優先する）
+const SKILL_NAMES: Record<number, string> = {
+  1601: 'ブレイズスイング',
+  1602: 'ブレイズスイング',
+  1603: 'ブレイズスイング',
+  1604: 'ブレイズスイング',
+  1605: 'スパイラルブロウ',
+  1606: 'ブレイズアクス',
+  1607: 'ツインラッシュ',
+  1608: 'ラースアクス',
+  1612: 'アクススパイラル',
+  1613: 'バーニングラッシュ',
+  1618: 'ヴォルテクスインパクト',
+};
+
+// 名前の優先順: ツインストライカーの確認済み → イマジン名 → スキル名の表 → ID
+export function skillLabel(skillId: number, table?: SkillNameTable | null): string {
+  // 2031101〜2031199 は幸運の一撃（職業ごとに番号が違う）
+  if (skillId >= 2031101 && skillId <= 2031199) return '幸運の一撃';
+  return (
+    SKILL_NAMES[skillId] ??
+    imagineName(skillId, table) ??
+    table?.[String(skillId)] ??
+    `スキル ${skillId}`
+  );
+}
+
+// 詳細・比較で使う指標
+export interface DpsDetailStats {
+  dps: number;
+  tdps: number;
+  // 稼働率：実際に攻撃していた時間 / 戦闘時間
+  uptime: number;
+  // 手数：実働1秒あたりのヒット数
+  hitsPerSec: number;
+  avgHit: number;
+  critRate: number;
+  critShare: number;
+  luckyRate: number;
+  luckyShare: number;
+}
+
+function safeDiv(a: number, b: number) {
+  return b > 0 && Number.isFinite(a / b) ? a / b : 0;
+}
+
+export function detailStats(detail: DpsPlayerDetail): DpsDetailStats {
+  const elapsedSec = detail.elapsedMs / 1000;
+  const activeSec = detail.activeTimeMs / 1000;
+  return {
+    dps: safeDiv(detail.totalDamage, elapsedSec),
+    tdps: safeDiv(detail.totalDamage, activeSec),
+    uptime: Math.min(1, safeDiv(detail.activeTimeMs, detail.elapsedMs)),
+    hitsPerSec: safeDiv(detail.hits, activeSec),
+    avgHit: safeDiv(detail.totalDamage, detail.hits),
+    critRate: safeDiv(detail.critHits, detail.hits),
+    critShare: safeDiv(detail.critDamage, detail.totalDamage),
+    luckyRate: safeDiv(detail.luckyHits, detail.hits),
+    luckyShare: safeDiv(detail.luckyDamage, detail.totalDamage),
+  };
+}
+
+export interface DpsGapFactor {
+  label: string;
+  // 相手 / 自分 の比（1.15 なら相手が15%多い）
+  ratio: number;
+  // DPSの差のうち、この要素が占める割合（0〜1）
+  weight: number;
+}
+
+// DPS = 稼働率 × 手数 × 1撃の重さ なので、相手と自分の差をこの3つに分解する
+export function dpsGapFactors(target: DpsDetailStats, self: DpsDetailStats): DpsGapFactor[] {
+  const pairs: Array<[string, number, number]> = [
+    ['稼働率', target.uptime, self.uptime],
+    ['手数', target.hitsPerSec, self.hitsPerSec],
+    ['1撃の重さ', target.avgHit, self.avgHit],
+  ];
+  const factors = pairs.map(([label, a, b]) => ({ label, ratio: a > 0 && b > 0 ? a / b : 1 }));
+  const logs = factors.map((factor) => Math.abs(Math.log(factor.ratio)));
+  const sum = logs.reduce((acc, value) => acc + value, 0);
+  return factors.map((factor, index) => ({ ...factor, weight: sum > 0 ? logs[index] / sum : 0 }));
+}

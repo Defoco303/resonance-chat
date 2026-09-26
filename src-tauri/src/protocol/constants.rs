@@ -13,6 +13,9 @@ pub mod attr_type {
     pub const ATTR_PROFESSION_ID: i32 = 0xDC;
     pub const ATTR_FIGHT_POINT: i32 = 0x272E;
     pub const ATTR_ELITE_STATUS: i32 = 0xB6; // Elite/boss status flag
+    // ボス戦の開始時に1回だけ届き、値はターゲットを取っているプレイヤーの uid。
+    // ボスにだけ送られる（ボスバー表示用とみられる）ので、ボスの判定に使う
+    pub const ATTR_BOSS_BAR_TARGET: i32 = 0x1D7;
 }
 
 pub mod damage {

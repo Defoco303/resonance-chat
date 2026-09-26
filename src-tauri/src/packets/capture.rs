@@ -1,3 +1,4 @@
+use crate::packets::diag::{self, Counter};
 use crate::packets::{chat, dps};
 use crate::packets::reassembler::Reassembler;
 use crate::packets::utils::{BinaryReader, TCPReassembler};
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use windivert::WinDivert;
 use windivert::prelude::{CloseAction, WinDivertFlags, WinDivertParam};
 
@@ -38,6 +39,7 @@ const MAX_TRACKED_CONNECTIONS: usize = 128;
 const MAX_DECOMPRESSED_SIZE: usize = 1024 * 1024;
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
 const MAX_FRAME_NESTING: usize = 8;
+const DECOMPRESSED_LIMIT_ERROR: &str = "decompressed payload exceeded limit";
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -84,7 +86,7 @@ pub fn start_capture(handle: AppHandle) {
     let mut game_server_ip: Option<[u8; 4]> = None;
     let mut game_server_connection: Option<ConnectionKey> = None;
     let mut secondary: HashMap<String, (TCPReassembler, Reassembler, Instant)> = HashMap::new();
-    let mut dps_meter = dps::DpsMeter::default();
+    let dps_state = handle.state::<dps::DpsState>();
     let mut packet_count: u64 = 0;
 
     loop {
@@ -113,7 +115,16 @@ pub fn start_capture(handle: AppHandle) {
 
         packet_count += 1;
 
+        // ボス撃破後の待ち時間切れ・30秒間戦闘なしを、受信のたびに確認する
+        {
+            let mut meter = dps_state.lock();
+            meter.poll(diag::now_ms());
+            emit_encounter_ends(&handle, &mut meter);
+        }
+
         if pkt.data.len() > MAX_CAPTURE_PACKET_SIZE {
+            diag::add(Counter::CaptureOversizeDrops, 1);
+            diag::net(format!("capture_oversize_drop len={}", pkt.data.len()));
             continue;
         }
 
@@ -148,11 +159,15 @@ pub fn start_capture(handle: AppHandle) {
                 "Game server detected/changed by scene signature: {}.{}.{}.{}:{}",
                 src_ip[0], src_ip[1], src_ip[2], src_ip[3], connection.src_port
             );
+            diag::net(format!(
+                "server_change reason=scene_signature server={}.{}.{}.{}:{} meter_reset={}",
+                src_ip[0], src_ip[1], src_ip[2], src_ip[3], connection.src_port, was_connected
+            ));
             game_server_ip = Some(src_ip);
             game_server_connection = Some(connection);
             secondary.clear();
             if was_connected {
-                reset_dps_meter(&handle, &mut dps_meter);
+                reset_dps_meter(&handle, &mut dps_state.lock());
             }
         }
 
@@ -164,11 +179,15 @@ pub fn start_capture(handle: AppHandle) {
                     "Game server detected/changed: {}.{}.{}.{}",
                     detected[0], detected[1], detected[2], detected[3]
                 );
+                diag::net(format!(
+                    "server_change reason=login_signature server={}.{}.{}.{}:{} meter_reset={}",
+                    detected[0], detected[1], detected[2], detected[3], connection.src_port, was_connected
+                ));
                 game_server_ip = Some(detected);
                 game_server_connection = Some(connection);
                 secondary.clear();
                 if was_connected {
-                    reset_dps_meter(&handle, &mut dps_meter);
+                    reset_dps_meter(&handle, &mut dps_state.lock());
                 }
             }
         }
@@ -186,23 +205,30 @@ pub fn start_capture(handle: AppHandle) {
                 );
 
                 trim_secondary_connections(&mut secondary);
-                let entry = secondary
-                    .entry(label)
-                    .or_insert_with(|| (TCPReassembler::new(), Reassembler::new(), Instant::now()));
+                let entry = secondary.entry(label.clone()).or_insert_with(|| {
+                    diag::net(format!("conn_track conn={label}"));
+                    (
+                        TCPReassembler::with_label(label.clone()),
+                        Reassembler::with_label(label.clone()),
+                        Instant::now(),
+                    )
+                });
 
                 if is_syn {
+                    diag::net(format!("tcp_syn_reset conn={label} seq={seq}"));
                     entry.0.reset(Some(seq));
-                    entry.1 = Reassembler::new();
+                    entry.1 = Reassembler::with_label(label.clone());
                 }
 
-                entry.2 = Instant::now();
+                let now = Instant::now();
+                entry.2 = now;
 
-                if let Some(reassembled) = entry.0.insert_segment(seq, payload) {
-                    entry.1.feed_owned(reassembled);
-                }
-
-                while let Some(frame) = entry.1.try_next() {
-                    process_frame(frame, &handle, &mut dps_meter);
+                // 抜けを飛ばした境目では、それより前のフレームを取り出してから次を渡す
+                for output in entry.0.insert_segment(seq, payload, now) {
+                    entry.1.feed_owned(output.data, output.discontinuity);
+                    while let Some(frame) = entry.1.try_next() {
+                        process_frame(frame, &handle, &mut dps_state.lock());
+                    }
                 }
             }
         }
@@ -297,7 +323,14 @@ fn detect_scene_server_change(payload: &[u8]) -> bool {
 
 fn reset_dps_meter(handle: &AppHandle, dps_meter: &mut dps::DpsMeter) {
     dps_meter.reset_for_server_change();
+    emit_encounter_ends(handle, dps_meter);
     let _ = handle.emit("dps-meter", dps_meter.snapshot());
+}
+
+pub fn emit_encounter_ends(handle: &AppHandle, dps_meter: &mut dps::DpsMeter) {
+    for event in dps_meter.take_end_events() {
+        let _ = handle.emit("dps-encounter-end", event);
+    }
 }
 
 fn process_frame(frame: Vec<u8>, handle: &AppHandle, dps_meter: &mut dps::DpsMeter) {
@@ -340,10 +373,14 @@ fn process_frame_inner(
             let nested = if is_compressed {
                 match decode_limited(nested.as_slice(), MAX_DECOMPRESSED_SIZE) {
                     Ok(d) => d,
-                    Err(_) => return,
+                    Err(err) => {
+                        record_decompress_failure("frame_down", nested.len(), &err);
+                        return;
+                    }
                 }
             } else {
                 if nested.len() > MAX_DECOMPRESSED_SIZE {
+                    record_oversize_drop("frame_down", nested.len());
                     return;
                 }
                 nested
@@ -364,6 +401,11 @@ fn process_frame_inner(
                     || frame_len > MAX_FRAME_SIZE
                     || nested_reader.remaining() < frame_len
                 {
+                    diag::add(Counter::FrameDownTrailing, 1);
+                    diag::net(format!(
+                        "frame_down_trailing frame_len={frame_len} remaining={}",
+                        nested_reader.remaining()
+                    ));
                     break;
                 }
 
@@ -404,10 +446,14 @@ fn process_notify(
     let payload = if is_compressed {
         match decode_limited(payload.as_slice(), MAX_DECOMPRESSED_SIZE) {
             Ok(d) => d,
-            Err(_) => return,
+            Err(err) => {
+                record_decompress_failure("notify", payload.len(), &err);
+                return;
+            }
         }
     } else {
         if payload.len() > MAX_DECOMPRESSED_SIZE {
+            record_oversize_drop("notify", payload.len());
             return;
         }
         payload
@@ -418,11 +464,31 @@ fn process_notify(
             let _ = handle.emit("chat-message", &msg);
         }
     } else if service_uuid == dps::DPS_SERVICE_UUID {
+        diag::raw(method_id, &payload);
         let changed = dps_meter.process_packet(method_id, &payload);
+        emit_encounter_ends(handle, dps_meter);
         if changed && (dps_meter.is_empty() || dps_meter.should_emit()) {
             let _ = handle.emit("dps-meter", dps_meter.snapshot());
         }
     }
+}
+
+fn record_decompress_failure(context: &str, compressed_len: usize, err: &std::io::Error) {
+    // 展開後サイズ超過もここに来る（decode_limited が返すエラー文言で区別する）
+    if err.to_string() == DECOMPRESSED_LIMIT_ERROR {
+        diag::add(Counter::OversizeDrops, 1);
+    } else {
+        diag::add(Counter::DecompressFailures, 1);
+    }
+    diag::net(format!(
+        "decompress_failure context={context} compressed_len={compressed_len} kind={:?} error={err}",
+        err.kind()
+    ));
+}
+
+fn record_oversize_drop(context: &str, len: usize) {
+    diag::add(Counter::OversizeDrops, 1);
+    diag::net(format!("oversize_drop context={context} len={len}"));
 }
 
 fn decode_limited(payload: &[u8], max_output: usize) -> std::io::Result<Vec<u8>> {
@@ -436,7 +502,7 @@ fn decode_limited(payload: &[u8], max_output: usize) -> std::io::Result<Vec<u8>>
     if out.len() > max_output {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "decompressed payload exceeded limit",
+            DECOMPRESSED_LIMIT_ERROR,
         ));
     }
 

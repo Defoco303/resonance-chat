@@ -7,17 +7,18 @@
     DPS_SETTINGS_KEY,
     fmtCompact,
     fmtSeconds,
-    isRealClass,
-    isRealClassSpec,
     isRealName,
-    loadBossList,
     loadDpsSettings,
+    loadHistory,
     loadIdCache,
-    normalizeBossList,
-    saveBossList,
+    ENCOUNTER_END_LABELS,
+    DPS_HISTORY_LIMIT,
     saveDpsSettings,
+    saveHistory,
     saveIdCache,
-    type DpsBossEntry,
+    type DpsEncounterEndPayload,
+    type DpsEncounterRecord,
+    type DpsPlayerDetail,
     type DpsIdentity,
     type DpsMonsterInfo,
     type DpsPlayerRow,
@@ -31,24 +32,17 @@
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { flip } from 'svelte/animate';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import DpsResultCard from './DpsResultCard.svelte';
+  import PlayerDetailPanel from './DpsPlayerDetail.svelte';
 
-  type PodiumEntry = DpsPlayerRow & {
-    rank: number;
-    color: string;
-    iconUrl: string;
-    placeholder?: boolean;
-  };
-  type PodiumGroup = {
-    metric: DpsMetricType;
-    label: string;
-    rateLabel: string;
-    entries: PodiumEntry[];
-  };
-  type ActiveTab = DpsMetricType | 'enemy';
-  type EnemyGroup = { id: number; name: string; eliteStatus: number; damageTaken: number; count: number };
+  type ActiveTab = DpsMetricType | 'enemy' | 'history';
+  type EnemyGroup = { id: number; name: string; eliteStatus: number; damageTaken: number; count: number; isBoss: boolean };
   const ENEMY_COLOR = '#f59e0b';
-  const PODIUM_DURATION_MS = 15000;
+  const HISTORY_COLOR = '#a78bfa';
+  const RESULT_CARD_MS = 15000;
+  // リザルトカードを出す終わり方（全滅して戻る「移動」も含める）
+  const RESULT_CARD_REASONS = new Set<DpsEncounterEndPayload['reason']>(['bossDefeated', 'sceneChange']);
   const METRIC_TABS: Array<{ id: DpsMetricType; label: string; color: string; rateLabel: string; totalLabel: string; empty: string }> = [
     { id: 'dps', label: 'DPS', color: '#f87171', rateLabel: 'DPS', totalLabel: 'DMG', empty: '戦闘データ待機中' },
     { id: 'tank', label: 'TANK', color: '#38bdf8', rateLabel: 'SCORE', totalLabel: 'TAKEN', empty: '被ダメージデータ待機中' },
@@ -75,18 +69,35 @@
   let scope = $state<DpsScope>('all');
   let settings = $state<DpsSettings>(loadDpsSettings());
   let settingsOpen = $state(false);
-  let bossPanelOpen = $state(false);
   let rankBursts = $state<Record<string, number>>({});
-  let podiumGroups = $state<PodiumGroup[]>([]);
-  let podiumToken = 0;
   let prevBossEngaged = false;
-  let bossList = $state<DpsBossEntry[]>([]);
   let idCache = $state<Record<string, DpsIdentity>>(loadIdCache());
-  let newBossId = $state('');
-  let newBossName = $state('');
+  let history = $state<DpsEncounterRecord[]>(loadHistory());
+  let resultCard = $state<DpsEncounterRecord | null>(null);
+  // リザルトカードは RESULT_CARD_MS で自動で閉じる（✕ でも閉じられる）
+  let resultCardTimer: ReturnType<typeof setTimeout> | null = null;
+  // プレイヤー詳細・自分との比較（戦闘中の一覧から、または履歴から開く）
+  let detailView = $state<{ source: 'live' | 'history'; uid: number } | null>(null);
+  let liveDetails = $state<DpsPlayerDetail[]>([]);
+  let liveDetailsBossOnly = $state(false);
+  let liveDetailTimer: ReturnType<typeof setInterval> | null = null;
+  // 履歴タブで表示中の戦闘（history[0] が最新）
+  let selectedHistoryIndex = $state(0);
+  const selectedHistory = $derived(history[Math.min(selectedHistoryIndex, history.length - 1)] ?? null);
+  const detailList = $derived(
+    detailView?.source === 'history' ? (selectedHistory?.details ?? []) : liveDetails
+  );
+  const detailSelfUid = $derived(
+    detailView?.source === 'history' ? (selectedHistory?.localPlayerUid ?? -1) : dpsMeter.localPlayerUid
+  );
+  const currentDetail = $derived(detailView ? detailList.find((d) => d.uid === detailView?.uid) : undefined);
+  const selfDetail = $derived(detailList.find((d) => d.uid === detailSelfUid));
+  const detailBossOnly = $derived(
+    detailView?.source === 'history' ? Boolean(selectedHistory?.bossOnly) : liveDetailsBossOnly
+  );
   const effectiveScope = $derived<DpsScope>(activeMetric === 'dps' ? scope : 'all');
   const currentMetric = $derived(
-    activeMetric === 'enemy' ? emptyMetric() : resolveMetric(dpsMeter, activeMetric, effectiveScope)
+    activeMetric === 'enemy' || activeMetric === 'history' ? emptyMetric() : resolveMetric(dpsMeter, activeMetric, effectiveScope)
   );
   const currentTab = $derived(metricTab(activeMetric));
   const displayPlayers = $derived(orderPlayers(currentMetric.players, activeMetric));
@@ -115,6 +126,17 @@
     saveDpsSettings(settings);
   }
 
+  // 調査用ログ（通信とダメージの記録）。設定はアプリ側に保存される
+  let diagLogging = $state(false);
+
+  async function updateDiagLogging(value: boolean) {
+    try {
+      diagLogging = await invoke<boolean>('set_diag_logging', { enabled: value });
+    } catch {
+      diagLogging = false;
+    }
+  }
+
   function updateAutoBossScope(value: boolean) {
     settings = { ...settings, autoBossScope: value };
     saveDpsSettings(settings);
@@ -124,9 +146,6 @@
     settings = { ...settings, rankAnimation };
     if (rankAnimation !== 'flashy') {
       rankBursts = {};
-    }
-    if (rankAnimation === 'off') {
-      podiumGroups = [];
     }
     saveDpsSettings(settings);
   }
@@ -185,15 +204,11 @@
     return value.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
   }
 
-  function fmtPercent(value: number) {
-    if (!Number.isFinite(value) || value <= 0) return '0%';
-    return `${Math.round(value)}%`;
-  }
-
-  function podiumMetricLabel(entry: PodiumEntry, group: PodiumGroup) {
-    if (entry.placeholder) return '—';
-    const value = group.metric === 'tank' ? fmtTankScore(tankScoreOf(entry)) : fmtCompact(entry.dps);
-    return `${value} ${group.rateLabel}(${fmtPercent(entry.damagePct)})`;
+  function playerBuildLabel(row: DpsPlayerRow) {
+    if (Number.isFinite(row.abilityScore) && row.abilityScore > 0) {
+      return `BP ${fmtCompact(row.abilityScore)}`;
+    }
+    return '';
   }
 
   function resolveMetric(payload: DpsMeterPayload, metric: DpsMetricType, sc: DpsScope): DpsMetricPayload {
@@ -201,10 +216,6 @@
       return payload.metrics?.dpsBossOnly ?? emptyMetric();
     }
     return metricWindow(payload, metric);
-  }
-
-  function hasAnyMetricData(payload: DpsMeterPayload) {
-    return METRIC_TABS.some((tab) => metricWindow(payload, tab.id).players.length > 0);
   }
 
   // Persist any real names/classes we learn, keyed by uid, so a player whose
@@ -228,9 +239,7 @@
       const cur = { ...(next[key] ?? {}) };
       let updated = false;
       if (isRealName(row.name) && cur.name !== row.name) { cur.name = row.name; updated = true; }
-      if (isRealClass(row.className) && cur.className !== row.className) { cur.className = row.className; updated = true; }
-      if (isRealClassSpec(row.classSpecName) && cur.classSpecName !== row.classSpecName) { cur.classSpecName = row.classSpecName; updated = true; }
-      if (updated) { next[key] = cur; changed = true; }
+      if (updated) { next[key] = { name: cur.name }; changed = true; }
     }
     if (changed) {
       idCache = next;
@@ -242,12 +251,13 @@
     return isRealName(name) ? name : (idCache[String(uid)]?.name ?? name);
   }
 
-  function effClass(uid: number, className: string) {
-    return isRealClass(className) ? className : (idCache[String(uid)]?.className ?? className);
+  // 職業はゲーム内で頻繁に切り替えられるため、保存済みの職業・型は使わず今の値だけを表示する
+  function effClass(_uid: number, className: string) {
+    return className;
   }
 
-  function effClassSpec(uid: number, classSpecName: string) {
-    return isRealClassSpec(classSpecName) ? classSpecName : (idCache[String(uid)]?.classSpecName ?? classSpecName);
+  function effClassSpec(_uid: number, classSpecName: string) {
+    return classSpecName;
   }
 
   function rowClassSpecLabel(row: DpsPlayerRow) {
@@ -255,36 +265,16 @@
   }
 
   function setActiveMetric(metric: ActiveTab) {
+    closeDetail();
     activeMetric = metric;
+    if (metric === 'history') selectedHistoryIndex = 0;
     rankBursts = {};
     settingsOpen = false;
-    bossPanelOpen = false;
   }
 
   function setScope(next: DpsScope) {
     scope = next;
     rankBursts = {};
-  }
-
-  function persistBossList() {
-    bossList = normalizeBossList(bossList);
-    saveBossList(bossList);
-    void invoke('set_boss_list', { entries: bossList }).catch(() => {});
-  }
-
-  function addBoss() {
-    const id = Number.parseInt(newBossId, 10);
-    if (!Number.isInteger(id) || id < 0) return;
-    const name = newBossName.trim() || `Boss ${id}`;
-    bossList = normalizeBossList([...bossList.filter((b) => b.id !== id), { id, name }]);
-    newBossId = '';
-    newBossName = '';
-    persistBossList();
-  }
-
-  function removeBoss(id: number) {
-    bossList = bossList.filter((b) => b.id !== id);
-    persistBossList();
   }
 
   function groupEnemies(list: DpsMonsterInfo[]): EnemyGroup[] {
@@ -295,6 +285,7 @@
         g.count += 1;
         g.damageTaken += e.damageTaken;
         if (e.eliteStatus > g.eliteStatus) g.eliteStatus = e.eliteStatus;
+        if (e.isBoss) g.isBoss = true;
         if (e.id !== 0 && e.name && e.name !== g.name) g.name = e.name;
       } else {
         map.set(e.id, {
@@ -303,119 +294,16 @@
           eliteStatus: e.eliteStatus,
           damageTaken: e.damageTaken,
           count: 1,
+          isBoss: e.isBoss,
         });
       }
     }
     return [...map.values()].sort((a, b) => b.damageTaken - a.damageTaken);
   }
 
-  function isEnemyBoss(id: number) {
-    return bossList.some((b) => b.id === id);
-  }
-
-  function bossEntryName(id: number) {
-    return bossList.find((b) => b.id === id)?.name ?? '';
-  }
-
-  function renameBoss(id: number, name: string) {
-    const trimmed = name.trim();
-    bossList = bossList.map((b) => (b.id === id ? { ...b, name: trimmed || `Boss ${id}` } : b));
-    persistBossList();
-  }
-
-  function toggleEnemyBoss(monster: { id: number; name: string }) {
-    if (monster.id === 0) return;
-    if (isEnemyBoss(monster.id)) {
-      bossList = bossList.filter((b) => b.id !== monster.id);
-    } else {
-      const name = monster.name && !monster.name.startsWith('Monster ') ? monster.name : `Boss ${monster.id}`;
-      bossList = normalizeBossList([...bossList.filter((b) => b.id !== monster.id), { id: monster.id, name }]);
-    }
-    persistBossList();
-  }
-
-  async function resetBosses() {
-    try {
-      const defaults = await invoke<DpsBossEntry[]>('reset_boss_list');
-      bossList = normalizeBossList(defaults);
-      saveBossList(bossList);
-    } catch {}
-  }
-
-  async function initBossList() {
-    const saved = loadBossList();
-    if (saved.length > 0) {
-      bossList = saved;
-      await invoke('set_boss_list', { entries: bossList }).catch(() => {});
-      return;
-    }
-    try {
-      const defaults = await invoke<DpsBossEntry[]>('get_boss_list');
-      bossList = normalizeBossList(defaults);
-      saveBossList(bossList);
-    } catch {
-      bossList = [];
-    }
-  }
-
-  function placeholderEntry(rank: number): PodiumEntry {
-    return {
-      uid: -rank,
-      name: '該当者なし',
-      className: 'Unknown Class',
-      classSpecName: '',
-      abilityScore: -1,
-      totalDamage: 0,
-      dps: 0,
-      damagePct: 0,
-      critRate: 0,
-      hits: 0,
-      tankScore: 0,
-      avgTaken: 0,
-      rank,
-      color: '#64748b',
-      iconUrl: '',
-      placeholder: true,
-    };
-  }
-
-  function markResetPodium(next: DpsMeterPayload) {
-    if (settings.rankAnimation === 'off') return;
-    if (!hasAnyMetricData(dpsMeter) || hasAnyMetricData(next)) return;
-
-    const token = Date.now();
-    podiumToken = token;
-    podiumGroups = METRIC_TABS
-      .map((tab) => {
-        const entries: PodiumEntry[] = orderPlayers(metricWindow(dpsMeter, tab.id).players, tab.id).slice(0, 3).map((row, index) => ({
-          ...row,
-          name: effName(row.uid, row.name),
-          rank: index + 1,
-          color: rowColor(effClass(row.uid, row.className)),
-          iconUrl: classIconUrl(effClass(row.uid, row.className)),
-        }));
-        const hadData = entries.length > 0;
-        while (hadData && entries.length < 3) {
-          entries.push(placeholderEntry(entries.length + 1));
-        }
-        return {
-          metric: tab.id,
-          label: tab.label,
-          rateLabel: tab.rateLabel,
-          entries,
-        };
-      })
-      .filter((group) => group.entries.length > 0);
-
-    window.setTimeout(() => {
-      if (podiumToken !== token) return;
-      podiumGroups = [];
-    }, PODIUM_DURATION_MS);
-  }
-
   function markRankUps(next: DpsMeterPayload) {
     if (settings.rankAnimation !== 'flashy') return;
-    if (activeMetric === 'enemy') return;
+    if (activeMetric === 'enemy' || activeMetric === 'history') return;
 
     const previousRanks = new Map(orderPlayers(resolveMetric(dpsMeter, activeMetric, effectiveScope).players, activeMetric).map((row, index) => [row.uid, index]));
     const nextBursts = { ...rankBursts };
@@ -516,25 +404,132 @@
     return classColor(settings, className);
   }
 
+  function toEncounterRecord(event: DpsEncounterEndPayload): DpsEncounterRecord {
+    const result = event.result;
+    const named = (row: DpsPlayerRow) => ({ ...row, name: effName(row.uid, row.name) });
+    // ボス戦はボス本体へのダメージだけで集計する（呼び出された雑魚へのダメージは含めない）
+    const bossOnly = result.metrics?.dpsBossOnly;
+    const isBossFight = Boolean(result.bossEngaged && bossOnly && bossOnly.players.length > 0);
+    const dps = isBossFight && bossOnly ? bossOnly : metricWindow(result, 'dps');
+    const topHeal = metricWindow(result, 'heal').players[0];
+    const topTank = orderPlayers(metricWindow(result, 'tank').players, 'tank')[0];
+    return {
+      id: `${event.endedAtMs}-${Math.random().toString(36).slice(2, 8)}`,
+      reason: event.reason,
+      endedAtMs: event.endedAtMs,
+      bossName: result.bossName ?? '',
+      elapsedMs: result.elapsedMs,
+      totalDps: dps.totalRate,
+      totalDamage: dps.totalValue,
+      bossOnly: isBossFight,
+      localPlayerUid: result.localPlayerUid,
+      players: dps.players.map(named),
+      topHeal: topHeal ? named(topHeal) : undefined,
+      topTank: topTank ? named(topTank) : undefined,
+      details: event.details.map((detail) => ({ ...detail, name: effName(detail.uid, detail.name) })),
+    };
+  }
+
+  function handleEncounterEnd(event: DpsEncounterEndPayload) {
+    learnIdentities(event.result);
+    const record = toEncounterRecord(event);
+    // ダメージ0の戦闘（回復だけなど）は履歴に残さない
+    if (record.totalDamage <= 0) return;
+    // 履歴に残すのはボスと戦った戦闘だけ
+    if (!record.bossOnly) return;
+    // 履歴を見ている最中に新しい記録が増えても、表示中の戦闘がずれないようにする
+    if (history.length > 0) {
+      selectedHistoryIndex = Math.min(selectedHistoryIndex + 1, DPS_HISTORY_LIMIT - 1);
+    }
+    history = [record, ...history].slice(0, DPS_HISTORY_LIMIT);
+    saveHistory(history);
+    if (RESULT_CARD_REASONS.has(record.reason)) {
+      showResultCard(record);
+    }
+  }
+
+  function showResultCard(record: DpsEncounterRecord) {
+    resultCard = record;
+    if (resultCardTimer) clearTimeout(resultCardTimer);
+    resultCardTimer = setTimeout(closeResultCard, RESULT_CARD_MS);
+  }
+
+  function selectHistory(index: number) {
+    closeDetail();
+    selectedHistoryIndex = Math.max(0, Math.min(index, history.length - 1));
+    void tick().then(() => {
+      document.querySelector('.history-row.selected')?.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  // -1 で新しい戦闘へ、+1 で古い戦闘へ
+  function stepHistory(delta: number) {
+    selectHistory(selectedHistoryIndex + delta);
+  }
+
+  function onHistoryKeydown(event: KeyboardEvent) {
+    if (activeMetric !== 'history' || history.length === 0) return;
+    if ((event.target as HTMLElement | null)?.closest('input, textarea')) return;
+    if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+      event.preventDefault();
+      stepHistory(-1);
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      stepHistory(1);
+    }
+  }
+
+  function openDetail(source: 'live' | 'history', uid: number) {
+    closeDetail();
+    detailView = { source, uid };
+    if (source === 'live') {
+      void refreshLiveDetails();
+      // 戦闘中は1秒ごとに更新する
+      liveDetailTimer = setInterval(() => { void refreshLiveDetails(); }, 1000);
+    }
+  }
+
+  function closeDetail() {
+    detailView = null;
+    if (liveDetailTimer) {
+      clearInterval(liveDetailTimer);
+      liveDetailTimer = null;
+    }
+  }
+
+  async function refreshLiveDetails() {
+    const bossOnly = effectiveScope === 'boss';
+    try {
+      const details = await invoke<DpsPlayerDetail[]>('get_dps_details', { bossOnly });
+      liveDetails = details;
+      liveDetailsBossOnly = bossOnly;
+    } catch {}
+  }
+
+  function closeResultCard() {
+    resultCard = null;
+    if (resultCardTimer) {
+      clearTimeout(resultCardTimer);
+      resultCardTimer = null;
+    }
+  }
+
+  function historyTimeLabel(ms: number) {
+    const date = new Date(ms);
+    return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+  }
+
   function rankBurstKey(uid: number) {
     return `${activeMetric}:${uid}`;
-  }
-
-  function podiumMedal(rank: number) {
-    if (rank === 1) return '\u{1F3C5}';
-    if (rank === 2) return '\u{1F948}';
-    return '\u{1F949}';
-  }
-
-  function podiumRankLabel(rank: number) {
-    if (rank === 1) return '1st';
-    if (rank === 2) return '2nd';
-    return '3rd';
   }
 
   async function closeWindow() {
     await emit('dps-window-closed');
     await invoke('close_dps_window');
+  }
+
+  async function resetMeter() {
+    await invoke('reset_dps_meter').catch(() => {});
   }
 
   function beginDrag(event: PointerEvent) {
@@ -544,8 +539,10 @@
 
   onMount(async () => {
     applyChatTheme();
+    invoke<boolean>('get_diag_logging')
+      .then((value) => { diagLogging = value; })
+      .catch(() => {});
     await emit('dps-window-opened');
-    await initBossList();
     const unlistenDps = await listen<DpsMeterPayload>('dps-meter', ({ payload }) => {
       const bossEngaged = Boolean(payload.bossEngaged);
       if (settings.autoBossScope) {
@@ -557,9 +554,11 @@
       }
       prevBossEngaged = bossEngaged;
       learnIdentities(payload);
-      markResetPodium(payload);
       markRankUps(payload);
       dpsMeter = payload;
+    });
+    const unlistenEnd = await listen<DpsEncounterEndPayload>('dps-encounter-end', ({ payload }) => {
+      handleEncounterEnd(payload);
     });
     const unlistenTheme = await listen<Record<string, unknown>>('rchat-theme', ({ payload }) => {
       applyChatTheme(payload);
@@ -575,12 +574,17 @@
       }
     };
     window.addEventListener('storage', onStorage);
+    window.addEventListener('keydown', onHistoryKeydown);
 
     return () => {
       unlistenDps();
+      unlistenEnd();
       unlistenTheme();
       unlistenClose();
       window.removeEventListener('storage', onStorage);
+      window.removeEventListener('keydown', onHistoryKeydown);
+      if (resultCardTimer) clearTimeout(resultCardTimer);
+      closeDetail();
       void emit('dps-window-closed');
     };
   });
@@ -593,19 +597,11 @@
       <em>{fmtSeconds(dpsMeter.elapsedMs)}</em>
     </div>
     <div class="window-actions">
-      <button
-        class="icon-btn"
-        class:active={bossPanelOpen}
-        title="ボス設定"
-        aria-label="ボス設定"
-        onclick={() => { bossPanelOpen = !bossPanelOpen; if (bossPanelOpen) settingsOpen = false; }}
-      >
+      <button class="icon-btn" title="リセット" aria-label="リセット" onclick={() => { void resetMeter(); }}>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
-          <path d="M6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"></path>
-          <path d="M10 7h5"></path>
-          <path d="M10 11h6"></path>
+          <path d="M3 12a9 9 0 1 0 3-6.7"></path>
+          <path d="M3 3v6h6"></path>
         </svg>
       </button>
       <button
@@ -613,7 +609,7 @@
         class:active={settingsOpen}
         title="DPS設定"
         aria-label="DPS設定"
-        onclick={() => { settingsOpen = !settingsOpen; if (settingsOpen) bossPanelOpen = false; }}
+        onclick={() => { settingsOpen = !settingsOpen; }}
       >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -647,6 +643,12 @@
         style:--pc={ENEMY_COLOR}
         onclick={() => setActiveMetric('enemy')}
       >ENEMY</button>
+      <button
+        class="metric-pill"
+        class:on={activeMetric === 'history'}
+        style:--pc={HISTORY_COLOR}
+        onclick={() => setActiveMetric('history')}
+      >履歴</button>
     </div>
     {#if activeMetric === 'dps'}
       <div class="scope-toggle" role="group" aria-label="集計範囲">
@@ -665,32 +667,58 @@
   {#if activeMetric === 'enemy'}
     <main class="dps-list">
       {#each groupedEnemies as enemy (enemy.id)}
-        <div class="enemy-row" class:boss={isEnemyBoss(enemy.id)}>
+        <div class="enemy-row" class:boss={enemy.isBoss}>
           <div class="enemy-info">
-            {#if isEnemyBoss(enemy.id)}
-              <input
-                class="enemy-name-input"
-                value={bossEntryName(enemy.id)}
-                placeholder="ボス名"
-                onchange={(event) => renameBoss(enemy.id, (event.currentTarget as HTMLInputElement).value)}
-              />
-            {:else}
-              <span class="enemy-name">{enemy.name}</span>
-            {/if}
+            <span class="enemy-name">{enemy.name}</span>
             <span class="enemy-sub">
               {enemy.id === 0 ? 'ID不明' : `ID ${enemy.id}`}{#if enemy.count > 1} ({enemy.count}){/if} ・ {fmtCompact(enemy.damageTaken)} DMG{#if enemy.eliteStatus > 0} ・ ELITE{/if}
             </span>
           </div>
-          <button
-            class="enemy-toggle"
-            class:boss={isEnemyBoss(enemy.id)}
-            disabled={enemy.id === 0}
-            onclick={() => toggleEnemyBoss(enemy)}
-          >{enemy.id === 0 ? 'ID不明' : isEnemyBoss(enemy.id) ? 'ボス' : '雑魚'}</button>
+          <span class="enemy-toggle" class:boss={enemy.isBoss}>{enemy.isBoss ? 'ボス' : '雑魚'}</span>
         </div>
       {:else}
         <div class="dps-empty">交戦中の敵なし</div>
       {/each}
+    </main>
+  {:else if activeMetric === 'history'}
+    <main class="history-view">
+      {#if history.length === 0}
+        <div class="dps-empty">戦闘が終わると、ここに記録が残ります</div>
+      {:else}
+        {#if selectedHistory}
+          <div class="history-detail">
+            <DpsResultCard
+              record={selectedHistory}
+              colorOf={rowColor}
+              onSelectPlayer={selectedHistory.details ? (uid) => openDetail('history', uid) : undefined}
+              nav={{
+                index: selectedHistoryIndex,
+                total: history.length,
+                onPrev: () => stepHistory(-1),
+                onNext: () => stepHistory(1),
+              }}
+            />
+          </div>
+        {/if}
+        <div class="history-list" role="listbox" aria-label="戦闘履歴">
+          {#each history as record, index (record.id)}
+            <button
+              class="history-row"
+              class:selected={index === selectedHistoryIndex}
+              role="option"
+              aria-selected={index === selectedHistoryIndex}
+              onclick={() => selectHistory(index)}
+            >
+              <span class="history-time">{historyTimeLabel(record.endedAtMs)}</span>
+              <span class="history-info">
+                <strong>{record.bossName || '戦闘'}</strong>
+                <span>{ENCOUNTER_END_LABELS[record.reason]} ・ {fmtSeconds(record.elapsedMs)}</span>
+              </span>
+              <span class="history-value">{fmtCompact(record.totalDps)} DPS</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
     </main>
   {:else}
   <main class="dps-list">
@@ -702,6 +730,13 @@
         animate:flip={{ duration: settings.rankAnimation === 'off' ? 0 : 220 }}
         style:--bar={`${barMax > 0 ? Math.max(3, (activeMetric === 'tank' ? tankScoreOf(row) : row.totalDamage) / barMax * 100) : 0}%`}
         style:--class-color={rowColor(effClass(row.uid, row.className))}
+        class:clickable={activeMetric === 'dps'}
+        role="button"
+        tabindex={activeMetric === 'dps' ? 0 : -1}
+        aria-disabled={activeMetric !== 'dps'}
+        title={activeMetric === 'dps' ? '詳細・自分との比較を見る' : undefined}
+        onclick={() => { if (activeMetric === 'dps') openDetail('live', row.uid); }}
+        onkeydown={(event) => { if (activeMetric === 'dps' && event.key === 'Enter') openDetail('live', row.uid); }}
       >
         <div class="dps-class">
           <div class="dps-class-icon" aria-hidden="true">
@@ -717,6 +752,9 @@
         </div>
         <div class="dps-player">
           <span class="dps-name">{effName(row.uid, row.name)}</span>
+          {#if playerBuildLabel(row)}
+            <span class="dps-build">{playerBuildLabel(row)}</span>
+          {/if}
         </div>
         <div class="dps-values">
           {#if activeMetric === 'tank'}
@@ -726,7 +764,11 @@
             </span>
           {:else}
             <strong>{fmtCompact(row.dps)}</strong>
-            <span>{fmtCompact(row.totalDamage)} {currentTab.totalLabel} / {row.damagePct.toFixed(1)}%</span>
+            <span>
+              {fmtCompact(row.totalDamage)} {currentTab.totalLabel} / {row.damagePct.toFixed(1)}%{#if activeMetric === 'dps' && (row.tdps ?? 0) > 0}<span
+                  title="実際に攻撃していた時間で割ったDPS"
+                > / 実働 {fmtCompact(row.tdps ?? 0)}</span>{/if}
+            </span>
           {/if}
         </div>
       </div>
@@ -736,56 +778,36 @@
   </main>
   {/if}
 
-  {#if podiumGroups.length > 0}
-    <div
-      class="podium-showcase"
-      class:single-group={podiumGroups.length === 1}
-      aria-live="polite"
-    >
-      <div class="podium-burst" aria-hidden="true"></div>
-      {#each podiumGroups as group, groupIndex (group.metric)}
-        <div class="podium-section" style:--podium-group={groupIndex}>
-          <div class="podium-title">{group.label}</div>
-          <div class="podium-cards" class:solo={group.entries.length === 1} class:duo={group.entries.length === 2}>
-            {#each group.entries as entry (entry.uid)}
-              <div
-                class="podium-card rank-{entry.rank}"
-                class:placeholder={entry.placeholder}
-                style:--class-color={entry.color}
-                style:--podium-delay={`${(groupIndex * 3 + (3 - entry.rank)) * 600}ms`}
-              >
-                <div class="podium-medal" aria-hidden="true">{podiumMedal(entry.rank)}</div>
-                <div class="podium-icon" aria-hidden="true">
-                  {#if entry.placeholder}
-                    <span>–</span>
-                  {:else if entry.iconUrl}
-                    <img src={entry.iconUrl} alt="" />
-                  {:else}
-                    <span>?</span>
-                  {/if}
-                </div>
-                <div class="podium-rank">
-                  <span class="podium-rank-label">{podiumRankLabel(entry.rank)}</span>
-                  {#if !entry.placeholder && rowClassSpecLabel(entry)}
-                    <span class="podium-spec">{rowClassSpecLabel(entry)}</span>
-                  {/if}
-                </div>
-                <div class="podium-info">
-                  <strong>{entry.name}</strong>
-                  <em>{podiumMetricLabel(entry, group)}</em>
-                </div>
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/each}
+  {#if resultCard}
+    <div class="result-overlay" aria-live="polite">
+      <DpsResultCard record={resultCard} colorOf={rowColor} onClose={closeResultCard} showRanking={false} />
     </div>
   {/if}
-  {#if bossPanelOpen}
+
+  {#if detailView}
+    <div class="detail-overlay">
+      {#if currentDetail}
+        <PlayerDetailPanel
+          detail={currentDetail}
+          self={selfDetail}
+          bossOnly={detailBossOnly}
+          colorOf={rowColor}
+          onBack={closeDetail}
+        />
+      {:else}
+        <div class="detail-missing">
+          <p>このプレイヤーの内訳はまだありません。</p>
+          <button class="mini-btn" onclick={closeDetail}>戻る</button>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if settingsOpen}
     <button
       class="settings-backdrop"
-      aria-label="ボス設定を閉じる"
-      onclick={() => { bossPanelOpen = false; }}
+      aria-label="DPS設定を閉じる"
+      onclick={() => { settingsOpen = false; }}
     ></button>
     <aside class="settings-panel">
       <div class="settings-head">
@@ -799,51 +821,6 @@
         />
         <span>ボス戦になったら自動でボス表示に切り替える</span>
       </label>
-      <div class="settings-head">
-        <span>ボスリスト ({bossList.length})</span>
-        <button class="mini-btn" onclick={() => { void resetBosses(); }}>デフォルトに戻す</button>
-      </div>
-      <div class="boss-add">
-        <input
-          class="boss-input id"
-          type="number"
-          min="0"
-          placeholder="ID"
-          bind:value={newBossId}
-        />
-        <input
-          class="boss-input name"
-          type="text"
-          placeholder="名前 (任意)"
-          bind:value={newBossName}
-        />
-        <button class="mini-btn" onclick={addBoss}>追加</button>
-      </div>
-      <div class="boss-list">
-        {#each bossList as boss (boss.id)}
-          <div class="boss-row">
-            <span class="boss-id">{boss.id}</span>
-            <span class="boss-name">{boss.name}</span>
-            <button
-              class="boss-remove"
-              title="削除"
-              aria-label="削除"
-              onclick={() => removeBoss(boss.id)}
-            >×</button>
-          </div>
-        {:else}
-          <div class="boss-empty">登録なし</div>
-        {/each}
-      </div>
-    </aside>
-  {/if}
-  {#if settingsOpen}
-    <button
-      class="settings-backdrop"
-      aria-label="DPS設定を閉じる"
-      onclick={() => { settingsOpen = false; }}
-    ></button>
-    <aside class="settings-panel">
       <div class="settings-head">
         <span>順位演出</span>
       </div>
@@ -861,6 +838,17 @@
           onclick={() => updateRankAnimation('off')}
         >OFF</button>
       </div>
+      <div class="settings-head">
+        <span>調査用ログ</span>
+      </div>
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={diagLogging}
+          onchange={(event) => updateDiagLogging((event.currentTarget as HTMLInputElement).checked)}
+        />
+        <span>通信とダメージの記録を保存する（不具合の調査用。最新5回分まで）</span>
+      </label>
       <div class="settings-head">
         <span>職業カラー</span>
         <button class="mini-btn" onclick={resetClassColors}>リセット</button>
@@ -991,7 +979,7 @@
     grid-template-columns: minmax(64px, 72px) minmax(0, 1fr) minmax(88px, auto);
     align-items: center;
     gap: 6px;
-    min-height: 27px;
+    min-height: 32px;
     margin: 0 3px 2px;
     padding: 3px 6px 3px 3px;
     border: 1px solid color-mix(in srgb, var(--class-color) 38%, rgb(var(--surface)));
@@ -1123,6 +1111,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .dps-build {
+    display: block;
+    margin-top: 2px;
+    color: color-mix(in srgb, var(--class-color) 46%, var(--text-dim));
+    font-size: 0.58em;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .dps-values {
     min-width: 0;
     text-align: right;
@@ -1154,286 +1153,109 @@
     text-align: center;
   }
 
-  .podium-showcase {
+  .detail-overlay {
     position: absolute;
-    inset: 98px 6px auto;
-    z-index: 18;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 7px;
-    padding: 6px;
-    pointer-events: none;
-    animation: podium-layer 15000ms ease both;
+    inset: 69px 0 0;
+    z-index: 16;
+    overflow-y: auto;
+    background: rgb(var(--bg) / 0.97);
+    border-top: 1px solid var(--border);
   }
-  .podium-showcase.single-group {
-    inset-inline: 24px;
-  }
-  .podium-section {
-    position: relative;
-    min-width: 0;
-    display: grid;
-    gap: 3px;
-  }
-  .podium-title {
-    justify-self: start;
-    padding: 2px 8px;
-    border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
-    border-radius: 999px;
-    background: rgb(var(--surface) / 0.9);
-    color: var(--accent);
-    font-size: 0.68em;
-    font-weight: 900;
-    letter-spacing: 0.06em;
-  }
-  .podium-cards {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
-  }
-  .podium-cards.duo .rank-2,
-  .podium-cards.solo .rank-1 {
-    grid-column: auto;
-  }
-  .podium-burst {
-    position: absolute;
-    inset: 2px 0 auto;
-    height: 52px;
-    border-radius: 8px;
-    background:
-      linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 34%, transparent), transparent);
-    filter: blur(5px);
-    opacity: 0;
-    animation: podium-burst 850ms ease-out both;
-  }
-  .podium-card {
-    position: relative;
-    min-width: 0;
-    display: grid;
-    grid-template-columns: 28px 34px minmax(0, 1fr);
-    align-items: center;
-    gap: 5px;
-    min-height: 44px;
-    padding: 5px 10px 5px 5px;
-    border: 1px solid color-mix(in srgb, var(--class-color) 74%, white);
-    border-radius: 7px;
-    background:
-      linear-gradient(180deg,
-        color-mix(in srgb, var(--class-color) 30%, rgb(var(--surface))) 0%,
-        color-mix(in srgb, var(--class-color) 16%, rgb(var(--bg))) 100%);
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--class-color) 26%, transparent),
-      0 10px 24px rgb(0 0 0 / 0.46),
-      inset 0 1px 0 rgb(255 255 255 / 0.18);
-    overflow: hidden;
-    animation: podium-card 330ms linear both;
-    animation-delay: var(--podium-delay);
-  }
-  .podium-card.placeholder {
-    border-color: color-mix(in srgb, var(--class-color) 40%, var(--border));
-    opacity: 0.78;
-  }
-  .podium-card::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background:
-      linear-gradient(115deg, transparent 0 28%, rgb(255 255 255 / 0.22) 42%, transparent 58% 100%);
-    translate: -110% 0;
-    animation: podium-sheen 1100ms ease-out both;
-    animation-delay: calc(var(--podium-delay) + 300ms);
-    pointer-events: none;
-  }
-  .podium-card.rank-1 {
-    transform-origin: center right;
-    border-color: color-mix(in srgb, var(--class-color) 86%, white);
-  }
-  .podium-card.rank-1::after {
-    content: '';
-    position: absolute;
-    inset: -35% -18%;
-    background:
-      radial-gradient(circle at 18% 30%, rgb(255 255 255 / 0.9) 0 2px, transparent 3px),
-      radial-gradient(circle at 76% 24%, rgb(255 255 255 / 0.85) 0 1px, transparent 3px),
-      linear-gradient(115deg, transparent 0 38%, rgb(255 255 255 / 0.72) 48%, transparent 58% 100%);
-    opacity: 0;
-    rotate: -7deg;
-    translate: -70% 0;
-    filter: blur(0.2px) drop-shadow(0 0 9px color-mix(in srgb, var(--class-color) 70%, white));
-    animation: podium-kira 2600ms ease-out infinite;
-    animation-delay: calc(var(--podium-delay) + 330ms);
-    pointer-events: none;
-  }
-  .podium-medal {
-    position: absolute;
-    right: 7px;
-    top: 4px;
-    z-index: 4;
-    font-size: 1.18em;
-    filter: drop-shadow(0 2px 5px rgb(0 0 0 / 0.45));
-  }
-  .podium-icon {
-    position: relative;
-    z-index: 3;
-    width: 28px;
-    height: 28px;
+  .detail-overlay::-webkit-scrollbar { width: 3px; }
+  .detail-overlay::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .detail-missing {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
-    border-radius: 7px;
-    background: rgb(var(--bg) / 0.46);
-    box-shadow:
-      inset 0 0 0 1px color-mix(in srgb, var(--class-color) 66%, transparent),
-      0 4px 13px rgb(0 0 0 / 0.32);
+    gap: 8px;
+    padding: 24px 12px;
+    color: var(--text-dim);
+    font-size: 0.85em;
+  }
+  .dps-row.clickable {
+    cursor: pointer;
+  }
+  .result-overlay {
+    position: absolute;
+    inset: 69px 6px auto;
+    z-index: 15;
+    max-height: calc(100% - 75px);
+    overflow-y: auto;
+    box-shadow: 0 8px 24px rgba(0 0 0 / 0.35);
+    border-radius: 10px;
+  }
+  .history-row {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    margin: 0 3px 2px;
+    width: calc(100% - 6px);
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: rgb(var(--surface) / 0.6);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .history-row:hover {
+    border-color: var(--accent);
+  }
+  .history-row.selected {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, rgb(var(--surface)));
+  }
+  .history-view {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 3px 0;
+  }
+  /* カードを上に。小さいウィンドウでも一覧が2行ぶんは見えるよう、カードは高さの6割まで */
+  .history-detail {
+    flex: 0 1 auto;
+    max-height: 60%;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 6px;
+  }
+  .history-list {
+    flex: 1;
+    min-height: 76px;
+    overflow-y: auto;
+  }
+  .history-list::-webkit-scrollbar,
+  .history-detail::-webkit-scrollbar { width: 3px; }
+  .history-list::-webkit-scrollbar-thumb,
+  .history-detail::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .history-time {
+    color: var(--text-dim);
+    font-size: 0.82em;
+    font-variant-numeric: tabular-nums;
+  }
+  .history-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .history-info strong {
     overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.9em;
   }
-  .podium-icon img {
-    width: calc(100% - 5px);
-    height: calc(100% - 5px);
-    object-fit: contain;
-    display: block;
-  }
-  .podium-icon span {
+  .history-info span {
     color: var(--text-dim);
     font-size: 0.76em;
-    font-weight: 900;
   }
-  .podium-rank {
-    position: relative;
-    z-index: 3;
-    min-width: 0;
-    display: grid;
-    align-content: center;
-    gap: 2px;
-    line-height: 1;
-  }
-  .podium-rank-label {
-    color: color-mix(in srgb, var(--class-color) 74%, white);
-    font-size: 0.8em;
-    font-weight: 950;
+  .history-value {
+    font-size: 0.86em;
+    font-weight: 700;
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .podium-spec {
-    min-width: 0;
-    color: color-mix(in srgb, var(--class-color) 64%, white);
-    font-size: 0.78em;
-    font-weight: 950;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .podium-info {
-    position: relative;
-    z-index: 3;
-    min-width: 0;
-    align-self: stretch;
-  }
-  .podium-info strong {
-    position: absolute;
-    left: 0;
-    top: 50%;
-    translate: 0 -50%;
-    max-width: calc(100% - 6px);
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text);
-    font-size: 1.04em;
-    font-weight: 900;
-  }
-  .rank-1 .podium-info strong {
-    font-size: 2.01em;
-  }
-  .podium-info em {
-    position: absolute;
-    right: 0;
-    bottom: 1px;
-    min-width: 0;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: color-mix(in srgb, var(--class-color) 48%, white);
-    font-style: normal;
-    font-size: 0.78em;
-    font-weight: 800;
-    font-variant-numeric: tabular-nums;
-  }
-  @keyframes podium-layer {
-    0% { opacity: 0; translate: 0 -12px; }
-    10% { opacity: 1; translate: 0 0; }
-    82% { opacity: 1; translate: 0 0; }
-    100% { opacity: 0; translate: 0 -8px; }
-  }
-  @keyframes podium-card {
-    0% {
-      opacity: 0;
-      translate: 95px 0;
-      scale: 0.98;
-      filter: brightness(1.3);
-    }
-    14% {
-      opacity: 1;
-      translate: 84px 0;
-      scale: 0.98;
-    }
-    52% {
-      translate: 30px 0;
-      filter: brightness(1.18);
-    }
-    74% {
-      translate: -18px 0;
-      scale: 1.03;
-      filter: brightness(1.05);
-    }
-    88% {
-      translate: 7px 0;
-      scale: 1.01;
-    }
-    100% {
-      opacity: 1;
-      translate: 0 0;
-      scale: 1;
-      filter: brightness(1);
-    }
-  }
-  @keyframes podium-burst {
-    0% { opacity: 0; scale: 0.7 0.6; }
-    18% { opacity: 0.9; scale: 1 1; }
-    100% { opacity: 0; scale: 1.08 1; }
-  }
-  @keyframes podium-sheen {
-    0% { translate: -110% 0; }
-    64% { translate: 110% 0; }
-    100% { translate: 110% 0; }
-  }
-  @keyframes podium-kira {
-    0% {
-      opacity: 0;
-      translate: -70% 0;
-      scale: 0.92;
-    }
-    10% {
-      opacity: 0.98;
-    }
-    26% {
-      opacity: 0.68;
-      translate: 72% 0;
-      scale: 1.04;
-    }
-    38% {
-      opacity: 0.22;
-      translate: 86% 0;
-    }
-    50% {
-      opacity: 0;
-      translate: 95% 0;
-    }
-    100% {
-      opacity: 0;
-      translate: -70% 0;
-    }
   }
 
   .settings-backdrop {
@@ -1611,71 +1433,6 @@
     cursor: pointer;
   }
 
-  .boss-add {
-    display: grid;
-    grid-template-columns: 72px minmax(0, 1fr) auto;
-    gap: 6px;
-    padding: 9px 12px;
-    border-bottom: 1px solid rgb(var(--bg) / 0.45);
-  }
-  .boss-input {
-    min-width: 0;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--input-bg);
-    color: var(--text);
-    font: inherit;
-    font-size: 0.8em;
-    padding: 4px 7px;
-  }
-  .boss-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .boss-list {
-    display: flex;
-    flex-direction: column;
-  }
-  .boss-row {
-    display: grid;
-    grid-template-columns: 64px minmax(0, 1fr) 22px;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    border-bottom: 1px solid rgb(var(--bg) / 0.45);
-    font-size: 0.82em;
-    color: var(--text);
-  }
-  .boss-id {
-    color: var(--text-dim);
-    font-variant-numeric: tabular-nums;
-  }
-  .boss-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .boss-remove {
-    width: 20px;
-    height: 20px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background: none;
-    color: var(--text-dim);
-    cursor: pointer;
-    font: inherit;
-    line-height: 1;
-    padding: 0;
-  }
-  .boss-remove:hover {
-    border-color: #f87171;
-    color: #f87171;
-  }
-  .boss-empty {
-    padding: 10px 12px;
-    color: var(--text-dim);
-    font-size: 0.8em;
-  }
   .enemy-row {
     display: flex;
     align-items: center;
@@ -1701,22 +1458,6 @@
     font-size: 0.92em;
     font-weight: 700;
   }
-  .enemy-name-input {
-    width: 100%;
-    min-width: 0;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background: var(--input-bg);
-    color: var(--text);
-    font: inherit;
-    font-size: 0.9em;
-    font-weight: 700;
-    padding: 2px 6px;
-  }
-  .enemy-name-input:focus {
-    outline: none;
-    border-color: #f59e0b;
-  }
   .enemy-sub {
     color: var(--text-dim);
     font-size: 0.74em;
@@ -1730,13 +1471,9 @@
     border: 1.5px solid var(--border);
     background: none;
     color: var(--text-dim);
-    cursor: pointer;
-    font: inherit;
+    text-align: center;
     font-size: 0.78em;
     font-weight: 800;
-  }
-  .enemy-toggle:hover {
-    border-color: var(--text-dim);
   }
   .enemy-toggle.boss {
     border-color: #f59e0b;

@@ -4,6 +4,7 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "strict": true,
+    "resolveJsonModule": true,
     "moduleResolution": "bundler"
   }
 }
